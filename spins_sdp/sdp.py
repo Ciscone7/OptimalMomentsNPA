@@ -3,7 +3,7 @@ import numpy as np
 import re
 from typing import Dict, List, Tuple, Any, Optional, Union, Literal
 
-from spin_sdp.pauli_strings import (
+from .pauli_strings import (
     pauli_normal_form,
     multiply_moments,
     dagger,

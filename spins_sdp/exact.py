@@ -8,35 +8,43 @@ AxisType = Literal["x", "y", "z"]
 # Type aliases for QuTiP objects
 Qobj = qt.Qobj
 
+def _single_site_op(N: int, i: int, op: Qobj) -> Qobj:
+    """Helper to create an operator acting on site i."""
+    op_list = [qt.qeye(2)] * N
+    op_list[i] = op
+    return qt.tensor(op_list)
+
 def ising_hamiltonian(N: int, J: float = 1.0, h: float = 0.0, k: float = 0.0, boundary: BoundaryType = 'periodic') -> qt.Qobj:
     """
     Construct the Hamiltonian for the transverse field Ising model:
     H = -J sum Z_i Z_{i+1} - h sum X_i - k sum Z_i
     """
-    def sigmax_site(N, i):
-        op_list = [qt.qeye(2)] * N
-        op_list[i] = qt.sigmax()
-        return qt.tensor(op_list)
-
-    def sigmaz_site(N, i):
-        op_list = [qt.qeye(2)] * N
-        op_list[i] = qt.sigmaz()
-        return qt.tensor(op_list)
-
     # Initialize Hamiltonian as a zero operator
     H = qt.qzero([2] * N)
+
+    sz = qt.sigmaz()
+    sx = qt.sigmax()
 
     # Define Pauli operators for each site
     for i in range(N):
         # Nearest-neighbor interaction: sigma_z * sigma_z
         if i < N - 1 or boundary == 'periodic':
-            H += -J * sigmaz_site(N, i) * sigmaz_site(N, (i + 1) % N)
+            j = (i + 1) % N
+            if N > 1:
+                # Optimization: Construct Z_i Z_j directly via tensor product
+                op_list = [qt.qeye(2)] * N
+                op_list[i] = sz
+                op_list[j] = sz
+                H += -J * qt.tensor(op_list)
+            else:
+                # Edge case N=1: Z_0 * Z_0 = I
+                H += -J * qt.tensor([qt.qeye(2)] * N)
         
         # Transverse field: sigma_x
-        H += -h * sigmax_site(N, i)
+        H += -h * _single_site_op(N, i, sx)
 
         # Parallel field: sigma_z
-        H += -k * sigmaz_site(N, i)
+        H += -k * _single_site_op(N, i, sz)
 
     return H
 
@@ -58,9 +66,7 @@ def magnetization_qutip(N: int, axis: AxisType = 'z', average: bool = True) -> q
     # Build the operator sum_i sigma_i^axis
     M = 0
     for i in range(N):
-        ops = [qt.qeye(2)] * N
-        ops[i] = pauli
-        M += qt.tensor(ops)
+        M += _single_site_op(N, i, pauli)
 
     if average:
         M = M / N

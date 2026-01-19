@@ -319,8 +319,9 @@ def build_moment_matrix_real_embedding(rep: MomentMatrixRep, y: cp.Variable
     A_vec = cp.Constant(CA) @ y
     B_vec = cp.Constant(CB) @ y
 
-    A = cp.reshape(A_vec, (n, n)) 
-    B = cp.reshape(B_vec, (n, n))
+    # Explicit order matching column-major flattening
+    A = cp.reshape(A_vec, (n, n), order="F")
+    B = cp.reshape(B_vec, (n, n), order="F")
 
     K = cp.bmat([[A, -B],
                  [B,  A]])

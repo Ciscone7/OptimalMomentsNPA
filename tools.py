@@ -5,9 +5,13 @@ import cvxpy as cp
 from typing import Final, List, Tuple, Union, Literal
 
 from spins_sdp.exact import ising_hamiltonian
-from spins_sdp.pauli_strings import npa_level
-from spins_sdp.pauli_strings_new import PauliWord
-from spins_sdp.sdp import moment_matrix_dict, dict_to_cvxpy_matrix_from_expr, build_sdp_variables, ising_energy_expr
+from spins_sdp.pauli_strings_new import (
+    PauliWord,
+    generate_npa_basis,
+    compile_moment_matrix_rep,
+    build_sdp_from_rep,
+    Operator,
+)
 
 BoundaryType = Literal["open", "periodic"]
 AxisType = Literal["x", "y", "z"]
@@ -28,59 +32,49 @@ def exact_ground_state_eigenpair(H: qt.Qobj) -> Tuple[float, qt.Qobj]:
 
 
 # TODO: Only works for 1D Ising model for now
-def npa_lb_energy(J: float, h: float, k: float, N: int, NPA_level: int, solver: str = 'CVXOPT', boundary: BoundaryType = "open") -> float:
-    """Compute a lower bound to the ground state energy using the NPA hierarchy.
+def npa_lb_energy(
+    J: float,
+    h: float,
+    k: float,
+    N: int,
+    NPA_level: int,
+    solver: str = "SCS",
+    boundary: BoundaryType = "open",
+) -> float:
+    """Compute a lower bound to the ground-state energy using the new moment-SDP pipeline.
 
-    Args:
-        J (float): Coupling strength.
-        h (float): Magnetic field strength (along x-axis).
-        k (float): Magnetic field strength (along z-axis).
-        N (int): Number of particles.
-        NPA_level (int): NPA hierarchy level.
-        solver (str): CVXPY solver to use.
-        boundary (BoundaryType): Boundary conditions ("open" or "periodic").
-    Returns:
-        float: Lower bound to the ground state energy.
+    Uses the compiled NPA basis from pauli_strings_new and builds an SDP with
+    moment variables y corresponding to Pauli words. The objective is the
+    Ising Hamiltonian expressed as a Pauli-word operator.
     """
-    
-    # 1. Generate basis
-    relaxation = npa_level(N=N, NPA_level=NPA_level)
-    
-    # 2. Build Moment Matrix Dictionary
-    M_dict = moment_matrix_dict(relaxation)
-    all_labels = sorted({label for (_, label) in M_dict.values()})
-    
-    # 3. Define Physical Variables
-    x = cp.Variable(N, name="x")
-    z = cp.Variable(N, name="z")
-    zz = cp.Variable(N-1 if boundary == "open" else N, name="zz")
-    
-    # 4. Map labels to expressions
-    label_to_expr, extra_moments = build_sdp_variables(x, z, zz, all_labels, boundary, N)
 
-    # 5. Construct SDP Matrix
-    M = dict_to_cvxpy_matrix_from_expr(M_dict, label_to_expr)
+    basis = generate_npa_basis(N=N, k=NPA_level).words
+    rep = compile_moment_matrix_rep(basis)
 
-    # 6. Define Objective (Energy)
-    H_energy = ising_energy_expr(J, h, k, boundary, x, z, zz)
+    # Build Ising Hamiltonian as a PauliWord->coeff dict
+    op: Operator = {}
 
-    # 7. Constraints
-    constraints = [
-        x >= -1, x <= 1,
-        z >= -1, z <= 1,
-        zz >= -1, zz <= 1,
-        M >> 0  # PSD constraint
-    ]
-    if extra_moments:
-        extra_vec = cp.hstack(list(extra_moments.values()))
-        constraints += [extra_vec >= -1, extra_vec <= 1]
+    # -J sum Z_i Z_{i+1}
+    for i in range(N):
+        if i < N - 1 or boundary == "periodic":
+            j = (i + 1) % N
+            w = PauliWord(0, (1 << i) | (1 << j))
+            op[w] = op.get(w, 0.0) - J
 
-    # 8. Solve
-    prob = cp.Problem(cp.Minimize(H_energy), constraints)
-    prob.solve(solver=solver, verbose=False)
-    # prob.solve(solver=solver, verbose=False, eps=1e-1, max_iters=200000)
-    
-    return prob.value
+    # -h sum X_i
+    for i in range(N):
+        w = PauliWord(1 << i, 0)
+        op[w] = op.get(w, 0.0) - h
+
+    # -k sum Z_i
+    for i in range(N):
+        w = PauliWord(0, 1 << i)
+        op[w] = op.get(w, 0.0) - k
+
+    sdp = build_sdp_from_rep(rep, op, sense="min")
+    sdp.problem.solve(solver=solver, verbose=False)
+
+    return float(sdp.problem.value)
 
 
 def _time_best_avg(fn, repeats: int):
@@ -144,7 +138,6 @@ def benchmark_npa_relaxation(
 ):
     """
     Returns a dict with arrays: N, E_lb, t_best, t_avg.
-    Note: if your npa_lb_energy doesn't accept SCS options, this times the default solve.
     """
     Ns = np.array(list(N_values), dtype=int)
 

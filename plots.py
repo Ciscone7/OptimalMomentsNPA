@@ -3,7 +3,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from tools import *
 
-from spins_sdp.pauli_strings import npa_level
+from spins_sdp.pauli_strings_new import generate_npa_basis
 from spins_sdp.exact import ising_hamiltonian
 
 def npa_basis_size_heatmap(N: int, max_NPA_level: int) -> np.ndarray:
@@ -15,7 +15,7 @@ def npa_basis_size_heatmap(N: int, max_NPA_level: int) -> np.ndarray:
   """
 
   def _basis_size(N: int, lvl: int) -> int:
-    return len(npa_level(N=N, NPA_level=lvl))
+    return len(generate_npa_basis(N=N, k=lvl).words)
 
   N_values = np.arange(1, N + 1)              # N = 1..N
   levels  = np.arange(1, max_NPA_level + 1)   # level = 1..max_NPA_level

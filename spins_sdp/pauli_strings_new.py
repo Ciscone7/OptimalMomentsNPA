@@ -1,8 +1,19 @@
 from __future__ import annotations
 from dataclasses import dataclass
-from typing import Final, Iterable, Dict, List, Tuple
+from typing import Final, Iterable, Dict, List, Literal, Tuple, Optional
+
+import numpy as np
+import cvxpy as cp
+import scipy.sparse as sp
 
 PhaseExp = int  # always interpreted mod 4
+
+# i^p for p in {0,1,2,3}
+_I_POW: Final[Tuple[complex, complex, complex, complex]] = (1+0j, 1j, -1+0j, -1j)
+
+# Precompute int real/imag coefficients once
+_PHASE_RE: Final[Tuple[int, int, int, int]] = tuple(int(c.real) for c in _I_POW)  # ( 1, 0,-1, 0)
+_PHASE_IM: Final[Tuple[int, int, int, int]] = tuple(int(c.imag) for c in _I_POW)  # ( 0, 1, 0,-1)
 
 
 @dataclass(frozen=True, slots=True)
@@ -46,8 +57,35 @@ class NPABasis:
     index: Dict[PauliWord, int]
 
 
-# i^p for p in {0,1,2,3}
-_I_POW: Final[Tuple[complex, complex, complex, complex]] = (1+0j, 1j, -1+0j, -1j)
+@dataclass(frozen=True, slots=True)
+class MomentMatrixRep:
+    """
+    Represents M_ij = (a_coef_ij + i b_coef_ij) * y[label_idx_ij],
+    where y[...] are real moment variables y_u = <u>.
+    """
+    basis: List[PauliWord]                 # w_0..w_{n-1}
+    labels: List[PauliWord]                # u_0..u_{m-1} (moments needed)
+    label_index: Dict[PauliWord, int]      # u -> idx
+    label_idx: np.ndarray                  # (n,n) int: which moment label is used at entry (i,j)
+    a_coef: np.ndarray                     # (n,n) int8: Re coefficient in { -1,0,1 }
+    b_coef: np.ndarray                     # (n,n) int8: Im coefficient in { -1,0,1 }
+    idx_I: int                             # index of identity label
+
+
+@dataclass(frozen=True, slots=True)
+class MomentSDP:
+    rep: MomentMatrixRep
+    y: cp.Variable
+    M_real: cp.Expression
+    M_imag: cp.Expression
+    PSD_block: cp.Expression
+    constraints: List[cp.Constraint]
+    objective: cp.Expression
+    problem: cp.Problem
+
+
+Operator = Dict[PauliWord, complex]
+Sense = Literal["min", "max"]
 
 
 def multiply_words(a: PauliWord, b: PauliWord) -> tuple[PhaseExp, PauliWord]:
@@ -186,6 +224,185 @@ def generate_npa_basis(N: int, k: int) -> NPABasis:
         min_len=min_len,
         index=index,
     )
+
+
+def compile_moment_matrix_rep(basis: List[PauliWord]) -> MomentMatrixRep:
+    """
+    Given basis monomials W=[w_i], build the compiled representation of the moment matrix:
+      M_ij = <w_i^† w_j> = (known phase) * <u_ij>
+    Since (reduced) Pauli words are Hermitian, w_i^† = w_i.
+
+    Output contains:
+      - the set of required moment labels u (canonical Pauli words),
+      - and for each (i,j) the label index plus the re/im phase coefficient.
+    """
+    n = len(basis)
+    if n == 0:
+        raise ValueError("Basis must be non-empty.")
+
+    I = PauliWord(0, 0)
+
+    # First pass: collect all labels u_ij that appear in products w_i w_j (upper triangle)
+    label_set: set[PauliWord] = {I}
+    for i in range(n):
+        wi = basis[i]
+        for j in range(i, n):
+            wj = basis[j]
+            _, u = multiply_words(wi, wj)  # dagger is trivial for Pauli words
+            label_set.add(u)
+
+    # Label ordering: put I first, then by (support, x_mask, z_mask)
+    labels_rest = sorted(
+        (u for u in label_set if u != I),
+        key=lambda u: (u.support_size(), u.x_mask, u.z_mask),
+    )
+    labels = [I] + labels_rest
+    label_index = {u: k for k, u in enumerate(labels)}
+    idx_I = label_index[I]
+
+    # Allocate compiled arrays
+    label_idx = np.empty((n, n), dtype=np.int32)
+    a_coef = np.empty((n, n), dtype=np.int8)
+    b_coef = np.empty((n, n), dtype=np.int8)
+
+    # Second pass: fill upper triangle, mirror using Hermitian structure
+    for i in range(n):
+        wi = basis[i]
+        for j in range(i, n):
+            wj = basis[j]
+            p, u = multiply_words(wi, wj)
+            
+            re = _PHASE_RE[p]
+            im = _PHASE_IM[p]
+            
+            k = label_index[u]
+
+            label_idx[i, j] = k
+            a_coef[i, j] = re
+            b_coef[i, j] = im
+
+            # Hermitian completion: M_ji = conj(M_ij)
+            label_idx[j, i] = k
+            a_coef[j, i] = re
+            b_coef[j, i] = -im
+
+    return MomentMatrixRep(
+        basis=basis,
+        labels=labels,
+        label_index=label_index,
+        label_idx=label_idx,
+        a_coef=a_coef,
+        b_coef=b_coef,
+        idx_I=idx_I,
+    )
+
+
+def build_moment_matrix_real_embedding(rep: MomentMatrixRep, y: cp.Variable
+                                       ) -> tuple[cp.Expression, cp.Expression, cp.Expression]:
+    """
+    Build M = A + iB where A,B are real matrices affine in y (y real),
+    then build the real embedding PSD matrix:
+        K = [[A, -B],
+             [B,  A]]  >= 0
+    """
+    n = rep.label_idx.shape[0]
+    m = len(rep.labels)
+
+    cols = rep.label_idx.reshape(-1, order="F").astype(np.int32)
+    dataA = rep.a_coef.reshape(-1, order="F").astype(float)
+    dataB = rep.b_coef.reshape(-1, order="F").astype(float)
+    rows = np.arange(n * n, dtype=np.int32)
+
+    CA = sp.coo_matrix((dataA, (rows, cols)), shape=(n * n, m)).tocsr()
+    CB = sp.coo_matrix((dataB, (rows, cols)), shape=(n * n, m)).tocsr()
+
+    A_vec = cp.Constant(CA) @ y
+    B_vec = cp.Constant(CB) @ y
+
+    A = cp.reshape(A_vec, (n, n)) 
+    B = cp.reshape(B_vec, (n, n))
+
+    K = cp.bmat([[A, -B],
+                 [B,  A]])
+    return A, B, K
+
+
+def compile_operator_linear_form(rep: MomentMatrixRep, op: Operator, *, tol: float = 1e-12
+                                 ) -> np.ndarray:
+    """
+    Compile <op> = sum_u c_u <u> into a real coefficient vector c over y,
+    assuming y_u = <u> are real (u Hermitian Pauli words).
+
+    For a Hermitian operator expressed in Pauli words, coefficients should be real.
+    We allow small imaginary parts (numerical noise) and drop them; otherwise we raise.
+    """
+    m = len(rep.labels)
+    c = np.zeros(m, dtype=float)
+
+    for u, coef in op.items():
+        if abs(coef.imag) > tol:
+            raise ValueError(f"Operator coefficient for {u} has significant imaginary part: {coef}")
+        if u not in rep.label_index:
+            raise KeyError(f"Operator contains label not present in rep.labels: {u}")
+        c[rep.label_index[u]] += float(coef.real)
+
+    return c
+
+
+def build_sdp_from_rep(rep: MomentMatrixRep,
+                       objective_op: Operator,
+                       *,
+                       sense: Sense = "min",
+                       extra_constraints: Optional[List[cp.Constraint]] = None
+                       ) -> MomentSDP:
+    """
+    Build and return a CVXPY+MOSEK-ready SDP:
+      optimize  <objective_op>  subject to  M >= 0  and y_I=1.
+
+    - Moments y_u are modeled as real variables.
+    - The complex PSD constraint is imposed via the real embedding block matrix.
+    """
+    m = len(rep.labels)
+    y = cp.Variable(m, name="y")  # real vector of moments
+
+    A, B, K = build_moment_matrix_real_embedding(rep, y)
+
+    constraints: List[cp.Constraint] = []
+    # Normalization: <I> = 1
+    constraints.append(y[rep.idx_I] == 1.0)
+
+    # PSD constraint
+    constraints.append(K >> 0)
+
+    # Any additional linear constraints
+    if extra_constraints:
+        constraints.extend(extra_constraints)
+
+    # Objective: <objective_op> = c @ y
+    c = compile_operator_linear_form(rep, objective_op)
+    obj_expr = c @ y  # real scalar
+
+    objective = cp.Minimize(obj_expr) if sense == "min" else cp.Maximize(obj_expr)
+    problem = cp.Problem(objective, constraints)
+
+    return MomentSDP(
+        rep=rep,
+        y=y,
+        M_real=A,
+        M_imag=B,
+        PSD_block=K,
+        constraints=constraints,
+        objective=obj_expr,
+        problem=problem,
+    )
+
+
+
+
+
+
+
+
 
 
 

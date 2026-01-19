@@ -1,6 +1,6 @@
 from __future__ import annotations
 from dataclasses import dataclass
-from typing import Final, Tuple
+from typing import Final, Iterable, Dict, List, Tuple
 
 PhaseExp = int  # always interpreted mod 4
 
@@ -22,6 +22,28 @@ class PauliWord:
     def __post_init__(self) -> None:
         if self.x_mask < 0 or self.z_mask < 0:
             raise ValueError("Bitmasks must be non-negative integers.")
+    
+    def support_size(self) -> int:
+        """Number of non-identity sites."""
+        return (self.x_mask | self.z_mask).bit_count()
+
+
+@dataclass(frozen=True, slots=True)
+class NPABasis:
+    """
+    Canonical unique basis up to level k (shortest-length representatives).
+
+    words:      all unique words reachable by <= k generator multiplications
+    levels:     levels[ℓ] are the words whose minimal length is exactly ℓ
+    min_len:    minimal length at which each word appears
+    index:      word -> index in `words` (deterministic ordering)
+    """
+    N: int
+    k: int
+    words: List[PauliWord]
+    levels: List[List[PauliWord]]
+    min_len: Dict[PauliWord, int]
+    index: Dict[PauliWord, int]
 
 
 # i^p for p in {0,1,2,3}
@@ -76,17 +98,97 @@ def multiply_terms(t1: PauliTerm, t2: PauliTerm) -> PauliTerm:
 
 
 
-# Single-qubit masks:
-I = PauliWord(0b0, 0b0)
-X = PauliWord(0b1, 0b0)
-Z = PauliWord(0b0, 0b1)
-Y = PauliWord(0b1, 0b1)
+def _atoms_xyz(N: int) -> List[PauliWord]:
+    """
+    Atomic generators in a fixed deterministic order: x0,y0,z0,x1,y1,z1,...,x(N-1),y(N-1),z(N-1).
+    """
+    if N <= 0:
+        raise ValueError("N must be a positive integer.")
+    atoms: List[PauliWord] = []
+    for i in range(N):
+        bit = 1 << i
+        atoms.append(PauliWord(bit, 0))     # X_i
+        atoms.append(PauliWord(bit, bit))   # Y_i
+        atoms.append(PauliWord(0, bit))     # Z_i
+    return atoms
 
-def show(a: PauliWord, b: PauliWord):
-    p, c = multiply_words(a, b)
-    return _I_POW[p], c
 
-print(show(X, Y))  # should be ( +i, Z )
-print(show(Y, X))  # should be ( -i, Z )
-print(show(Z, X))  # should be ( +i, Y )
-print(show(X, Z))  # should be ( -i, Y )
+def generate_npa_basis(N: int, k: int) -> NPABasis:
+    """
+    Generate the canonical unique basis up to level k.
+
+    Level definition:
+      Start from identity I.
+      At each step, multiply by any single-site generator in {X_i, Y_i, Z_i}.
+      Keep each resulting canonical PauliWord the *first* time it is discovered (minimal length).
+
+    Output ordering:
+      sort by (min_length, support_size, x_mask, z_mask).
+
+    Returns an NPABasis containing:
+      - words: concatenation of all levels (sorted deterministically)
+      - levels: list of per-length frontiers (also sorted deterministically)
+      - min_len: shortest length for each word
+      - index: mapping word -> row/col index
+    """
+    if k < 0:
+        raise ValueError("k must be >= 0.")
+    if N <= 0:
+        raise ValueError("N must be >= 1.")
+
+    I = PauliWord(0, 0)
+    atoms = _atoms_xyz(N)
+
+    # BFS structures
+    levels: List[List[PauliWord]] = [[] for _ in range(k + 1)]
+    min_len: Dict[PauliWord, int] = {I: 0}
+    frontier: List[PauliWord] = [I]
+    levels[0] = [I]
+
+    # BFS by length: each discovered word is assigned its minimal length
+    for length in range(1, k + 1):
+        next_set: set[PauliWord] = set()
+        for w in frontier:
+            for a in atoms:
+                _, w_new = multiply_words(w, a)   # ignore phase for the basis
+                if w_new not in min_len:          # first time discovered => minimal length
+                    min_len[w_new] = length
+                    next_set.add(w_new)
+
+        # ordering within the level
+        next_level = sorted(
+            next_set,
+            key=lambda ww: (ww.support_size(), ww.x_mask, ww.z_mask),
+        )
+        levels[length] = next_level
+        frontier = next_level
+
+        # early stop if nothing new appears
+        if not frontier:
+            # trim remaining empty levels for cleanliness
+            levels = levels[: length + 1]
+            break
+
+    # global ordering
+    all_words = list(min_len.keys())
+    all_words_sorted = sorted(
+        all_words,
+        key=lambda w: (min_len[w], w.support_size(), w.x_mask, w.z_mask),
+    )
+
+    index = {w: i for i, w in enumerate(all_words_sorted)}
+
+    return NPABasis(
+        N=N,
+        k=k,
+        words=all_words_sorted,
+        levels=levels,
+        min_len=min_len,
+        index=index,
+    )
+
+
+
+
+
+

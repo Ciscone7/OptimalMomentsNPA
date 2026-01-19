@@ -2,14 +2,17 @@ import time
 import numpy as np
 import qutip as qt
 import cvxpy as cp
-from typing import List, Tuple, Union, Literal
+from typing import Final, List, Tuple, Union, Literal
 
 from spins_sdp.exact import ising_hamiltonian
 from spins_sdp.pauli_strings import npa_level
+from spins_sdp.pauli_strings_new import PauliWord
 from spins_sdp.sdp import moment_matrix_dict, dict_to_cvxpy_matrix_from_expr, build_sdp_variables, ising_energy_expr
 
 BoundaryType = Literal["open", "periodic"]
 AxisType = Literal["x", "y", "z"]
+
+_I_POW: Final[Tuple[complex, complex, complex, complex]] = (1+0j, 1j, -1+0j, -1j)
 
 def exact_ground_state_eigenpair(H: qt.Qobj) -> Tuple[float, qt.Qobj]:
     """Compute the exact ground state energy of a Hamiltonian by diagonalization.
@@ -176,7 +179,29 @@ def benchmark_npa_relaxation(
         },
     }
 
+# --- Helpers for debugging / pretty printing ---
 
+def local_ops(word: PauliWord, N: int) -> str:
+    """Return a compact local-operator string like 'X I Z' for small N."""
+    out = []
+    for k in range(N):
+        xb = (word.x_mask >> k) & 1
+        zb = (word.z_mask >> k) & 1
+        if xb == 0 and zb == 0:
+            out.append("I")
+        elif xb == 1 and zb == 0:
+            out.append("X")
+        elif xb == 0 and zb == 1:
+            out.append("Z")
+        else:
+            out.append("Y")
+    return " ".join(out)
+
+def X(i: int) -> PauliWord: return PauliWord(1 << i, 0)
+def Z(i: int) -> PauliWord: return PauliWord(0, 1 << i)
+def Y(i: int) -> PauliWord: 
+    b = 1 << i
+    return PauliWord(b, b)
 
 
 

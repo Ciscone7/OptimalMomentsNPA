@@ -1,12 +1,14 @@
 from __future__ import annotations
 from dataclasses import dataclass
-from typing import Final, Iterable, Dict, List, Literal, Tuple, Optional
+from typing import Final, Iterable, Dict, List, Literal, Sequence, Tuple, Optional
 
 import numpy as np
 import cvxpy as cp
 import scipy.sparse as sp
 
 PhaseExp = int  # always interpreted mod 4
+
+Axis = Literal["x", "y", "z"]
 
 # i^p for p in {0,1,2,3}
 _I_POW: Final[Tuple[complex, complex, complex, complex]] = (1+0j, 1j, -1+0j, -1j)
@@ -38,6 +40,10 @@ class PauliWord:
         """Number of non-identity sites."""
         return (self.x_mask | self.z_mask).bit_count()
 
+@dataclass(frozen=True, slots=True)
+class PauliTerm:
+    coeff: complex
+    word: PauliWord
 
 @dataclass(frozen=True, slots=True)
 class NPABasis:
@@ -120,12 +126,6 @@ def multiply_words(a: PauliWord, b: PauliWord) -> tuple[PhaseExp, PauliWord]:
     return p, PauliWord(x3, z3)
 
 
-@dataclass(frozen=True, slots=True)
-class PauliTerm:
-    coeff: complex
-    word: PauliWord
-
-
 def multiply_terms(t1: PauliTerm, t2: PauliTerm) -> PauliTerm:
     """
     Multiply two Pauli terms (coeff * word), returning a single term in canonical form:
@@ -135,95 +135,29 @@ def multiply_terms(t1: PauliTerm, t2: PauliTerm) -> PauliTerm:
     return PauliTerm(t1.coeff * t2.coeff * _I_POW[p], w3)
 
 
-
-def _atoms_xyz(N: int) -> List[PauliWord]:
+def reduce_monomial(factors: Sequence[PauliWord]) -> PauliWord:
     """
-    Atomic generators in a fixed deterministic order: x0,y0,z0,x1,y1,z1,...,x(N-1),y(N-1),z(N-1).
+    Multiply a list of factors and return only the *canonical word label*, discarding the global phase.
     """
-    if N <= 0:
-        raise ValueError("N must be a positive integer.")
-    atoms: List[PauliWord] = []
-    for i in range(N):
-        bit = 1 << i
-        atoms.append(PauliWord(bit, 0))     # X_i
-        atoms.append(PauliWord(bit, bit))   # Y_i
-        atoms.append(PauliWord(0, bit))     # Z_i
-    return atoms
+    w = PauliWord(0, 0)  # identity
+    for f in factors:
+        _, w = multiply_words(w, f)
+    return w
 
 
-def generate_npa_basis(N: int, k: int) -> NPABasis:
+def local_pauli(site: int, axis: Axis) -> PauliWord:
     """
-    Generate the canonical unique basis up to level k.
-
-    Level definition:
-      Start from identity I.
-      At each step, multiply by any single-site generator in {X_i, Y_i, Z_i}.
-      Keep each resulting canonical PauliWord the *first* time it is discovered (minimal length).
-
-    Output ordering:
-      sort by (min_length, support_size, x_mask, z_mask).
-
-    Returns an NPABasis containing:
-      - words: concatenation of all levels (sorted deterministically)
-      - levels: list of per-length frontiers (also sorted deterministically)
-      - min_len: shortest length for each word
-      - index: mapping word -> row/col index
+    Return the PauliWord representing σ^axis_site on a single site (0-based indexing).
+    Encoding:
+      X: (x=1,z=0), Z: (x=0,z=1), Y: (x=1,z=1).
     """
-    if k < 0:
-        raise ValueError("k must be >= 0.")
-    if N <= 0:
-        raise ValueError("N must be >= 1.")
-
-    I = PauliWord(0, 0)
-    atoms = _atoms_xyz(N)
-
-    # BFS structures
-    levels: List[List[PauliWord]] = [[] for _ in range(k + 1)]
-    min_len: Dict[PauliWord, int] = {I: 0}
-    frontier: List[PauliWord] = [I]
-    levels[0] = [I]
-
-    # BFS by length: each discovered word is assigned its minimal length
-    for length in range(1, k + 1):
-        next_set: set[PauliWord] = set()
-        for w in frontier:
-            for a in atoms:
-                _, w_new = multiply_words(w, a)   # ignore phase for the basis
-                if w_new not in min_len:          # first time discovered => minimal length
-                    min_len[w_new] = length
-                    next_set.add(w_new)
-
-        # ordering within the level
-        next_level = sorted(
-            next_set,
-            key=lambda ww: (ww.support_size(), ww.x_mask, ww.z_mask),
-        )
-        levels[length] = next_level
-        frontier = next_level
-
-        # early stop if nothing new appears
-        if not frontier:
-            # trim remaining empty levels for cleanliness
-            levels = levels[: length + 1]
-            break
-
-    # global ordering
-    all_words = list(min_len.keys())
-    all_words_sorted = sorted(
-        all_words,
-        key=lambda w: (min_len[w], w.support_size(), w.x_mask, w.z_mask),
-    )
-
-    index = {w: i for i, w in enumerate(all_words_sorted)}
-
-    return NPABasis(
-        N=N,
-        k=k,
-        words=all_words_sorted,
-        levels=levels,
-        min_len=min_len,
-        index=index,
-    )
+    bit = 1 << site
+    if axis == "x":
+        return PauliWord(bit, 0)
+    if axis == "z":
+        return PauliWord(0, bit)
+    # axis == "y"
+    return PauliWord(bit, bit)
 
 
 def compile_moment_matrix_rep(basis: List[PauliWord]) -> MomentMatrixRep:

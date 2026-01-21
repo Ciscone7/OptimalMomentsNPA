@@ -201,3 +201,137 @@ def generate_heisenberg_paper_basis(
                             push(w)
 
     return out
+
+
+def generate_heisenberg_j2_basis_weak(
+    N: int,
+    *,
+    r: Optional[int] = None,
+    include_degree3: bool = True,
+    include_degree4: Optional[bool] = None
+) -> List[PauliWord]:
+    """
+    Generate the basis for Heisenberg chain with second-neighbor couplings (J_2 <= 1).
+    
+    Uses the same structure as the standard paper basis:
+      - 1
+      - σ_i^a
+      - σ_i^a σ_{i+j}^b for j=1..r (PBC)
+      - σ_i^a σ_{i+1}^b σ_{i+2}^c (contiguous triples)
+      - σ_i^a σ_{i+1}^b σ_{i+2}^c σ_{i+3}^d (contiguous quadruples)
+    
+    This is identical to generate_heisenberg_paper_basis and is included for
+    semantic clarity and potential future modifications.
+    
+    Args:
+        N: Number of spins
+        r: Max distance for degree-2 terms (default: paper default)
+        include_degree3: Whether to include degree-3 terms
+        include_degree4: Whether to include degree-4 terms
+        
+    Returns:
+        List of PauliWords forming the basis
+    """
+    # For J_2 <= 1, use the standard paper basis
+    return generate_heisenberg_paper_basis(
+        N=N,
+        r=r,
+        include_degree3=include_degree3,
+        include_degree4=include_degree4
+    )
+
+
+def generate_heisenberg_j2_basis_strong(
+    N: int,
+    *,
+    r: Optional[int] = None,
+) -> List[PauliWord]:
+    """
+    Generate the basis for Heisenberg chain with second-neighbor couplings (J_2 > 1).
+    
+    For strong second-neighbor coupling, use a modified basis that emphasizes
+    the j=2 structure:
+      - 1
+      - σ_i^a
+      - σ_i^a σ_{i+j}^b for j=1..r (PBC)
+      - σ_i^a σ_{i+2}^b σ_{i+4}^c (spaced triples)
+      - σ_i^a σ_{i+1}^b σ_{i+2}^c σ_{i+3}^d (contiguous quadruples)
+    
+    Args:
+        N: Number of spins
+        r: Max distance for degree-2 terms (default: paper default)
+        
+    Returns:
+        List of PauliWords forming the basis
+    """
+    if N <= 0:
+        raise ValueError("N must be positive.")
+    if r is None:
+        r = _paper_default_r(N)
+    if r < 1:
+        raise ValueError("r must be >= 1.")
+    if r > N - 1:
+        r = N - 1
+
+    axes: Tuple[Axis, Axis, Axis] = ("x", "y", "z")
+
+    out: List[PauliWord] = []
+    seen: Set[PauliWord] = set()
+
+    def push(w: PauliWord) -> None:
+        if w not in seen:
+            seen.add(w)
+            out.append(w)
+
+    # degree 0: identity
+    push(PauliWord(0, 0))
+
+    # degree 1: σ_i^a
+    for i in range(N):
+        for a in axes:
+            push(local_pauli(i, a))
+
+    # degree 2: σ_i^a σ_{i+j}^b, j=1..r (PBC)
+    for j in range(1, r + 1):
+        for i in range(N):
+            i2 = (i + j) % N
+            for a in axes:
+                for b in axes:
+                    w = reduce_monomial([local_pauli(i, a), local_pauli(i2, b)])
+                    push(w)
+
+    # degree 3: spaced triples σ_i^a σ_{i+2}^b σ_{i+4}^c (PBC)
+    # This emphasizes the j=2 structure
+    for i in range(N):
+        s1 = i
+        s2 = (i + 2) % N
+        s3 = (i + 4) % N
+        for a in axes:
+            for b in axes:
+                for c in axes:
+                    w = reduce_monomial([
+                        local_pauli(s1, a),
+                        local_pauli(s2, b),
+                        local_pauli(s3, c),
+                    ])
+                    push(w)
+
+    # degree 4: contiguous quadruples σ_i^a σ_{i+1}^b σ_{i+2}^c σ_{i+3}^d (PBC)
+    for i in range(N):
+        s1 = i
+        s2 = (i + 1) % N
+        s3 = (i + 2) % N
+        s4 = (i + 3) % N
+        for a in axes:
+            for b in axes:
+                for c in axes:
+                    for d in axes:
+                        w = reduce_monomial([
+                            local_pauli(s1, a),
+                            local_pauli(s2, b),
+                            local_pauli(s3, c),
+                            local_pauli(s4, d),
+                        ])
+                        push(w)
+
+    return out

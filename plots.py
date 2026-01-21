@@ -1,10 +1,13 @@
+from typing import Optional, Dict, Any
+
 from matplotlib.ticker import MaxNLocator
 import numpy as np
 import matplotlib.pyplot as plt
 from tools import *
 
-from spins_sdp.pauli_strings_new import generate_npa_basis
+from spins_sdp.basis_builder import generate_npa_basis, generate_heisenberg_paper_basis
 from spins_sdp.exact import ising_hamiltonian
+
 
 def npa_basis_size_heatmap(N: int, max_NPA_level: int) -> np.ndarray:
   """Generate a heatmap of NPA basis sizes for varying number of particles and NPA levels.
@@ -49,14 +52,325 @@ def npa_basis_size_heatmap(N: int, max_NPA_level: int) -> np.ndarray:
   plt.show()
 
 
+def plot_paper_heisenberg_results(
+    N_values,
+    boundary: str = "periodic",
+    solver: str = "MOSEK",
+    mosek_tol: float = 1e-9,
+    per_site: bool = True,
+) -> Dict:
+    """
+    Replicate the paper's findings for case B (Heisenberg chain).
+    
+    Plots exact ground state energy vs SDP lower bound using the paper's basis.
+    
+    Args:
+        N_values: Iterable of system sizes
+        boundary: "open" or "periodic" (paper uses periodic)
+        solver: default "MOSEK"
+        mosek_tol: MOSEK conic tolerance
+        per_site: if True, plot E/N instead of E
+        
+    Returns:
+        Dict with exact energies, SDP lower bounds, and gap
+    """
+    from spins_sdp import heisenberg_hamiltonian
+    
+    Ns = list(N_values)
+    exact_energies = []
+    sdp_lbs = []
+    
+    # Compute exact and SDP lower bound for each N
+    for N in Ns:
+        
+        # print(f"Computing N={N}...")
+        
+        # Exact ground state energy
+        H = heisenberg_hamiltonian(N, boundary=boundary)
+        eigenvalues = H.eigenenergies()
+        E0 = float(eigenvalues[0])
+        exact_energies.append(E0)
+        
+        # print(f"  Exact ground energy: {E0:.8f}")
+        
+        # print(f"  Computing basis and operator for N={N}...")
+        
+        # SDP lower bound using paper basis
+        basis = generate_heisenberg_paper_basis(N=N)
+        operator = heisenberg_operator(N=N, boundary=boundary)
+        
+        # print(f"  Solving SDP lower bound for N={N}...")
+        E_lb = solve_relaxation(
+            basis=basis,
+            operator=operator,
+            sense="min",
+            solver=solver,
+            mosek_tol=mosek_tol,
+            verbose=False,
+        )
+        sdp_lbs.append(E_lb)
+        # print(f"  SDP lower bound: {E_lb:.8f}")
+    
+    Ns_arr = np.array(Ns, dtype=float)
+    exact_energies = np.array(exact_energies)
+    sdp_lbs = np.array(sdp_lbs)
+    
+    # Compute gap
+    gap = exact_energies - sdp_lbs
+    
+    # Choose what to plot
+    if per_site:
+        exact_plot = exact_energies / Ns_arr
+        lb_plot = sdp_lbs / Ns_arr
+        gap_plot = gap / Ns_arr
+        ylabel = "Energy per site (E/N)"
+        ylabel_gap = "Gap per site (Exact - LB)/N"
+    else:
+        exact_plot = exact_energies
+        lb_plot = sdp_lbs
+        gap_plot = gap
+        ylabel = "Energy (E)"
+        ylabel_gap = "Gap (Exact - LB)"
+    
+    # Create figure with 2 subplots
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+    
+    # Plot 1: Energies
+    axes[0].plot(Ns, exact_plot, marker="o", label="Exact ground energy", linewidth=2)
+    axes[0].plot(Ns, lb_plot, marker="s", label="SDP lower bound (paper basis)", linewidth=2)
+    axes[0].set_xlabel("Number of particles N")
+    axes[0].set_ylabel(ylabel)
+    axes[0].set_title("Heisenberg Chain: Exact vs SDP Lower Bound")
+    axes[0].grid(True, alpha=0.3)
+    axes[0].legend()
+    axes[0].xaxis.set_major_locator(MaxNLocator(integer=True))
+    
+    # Plot 2: Gap
+    axes[1].plot(Ns, gap_plot, marker="^", color="red", linewidth=2)
+    axes[1].set_xlabel("Number of particles N")
+    axes[1].set_ylabel(ylabel_gap)
+    axes[1].set_title("Tightness of Relaxation: Gap")
+    axes[1].grid(True, which="both", alpha=0.3)
+    axes[1].xaxis.set_major_locator(MaxNLocator(integer=True))
+    
+    plt.tight_layout()
+    plt.show()
+    
+    # Print summary
+    print("=" * 80)
+    print("Heisenberg Chain (Paper Case B) - Exact vs SDP Comparison")
+    print("=" * 80)
+    print(f"{'N':<8} {'Exact E':<15} {'SDP LB':<15} {'Gap':<15} {'Gap/N':<15}")
+    print("-" * 80)
+    for i, N in enumerate(Ns):
+        print(f"{N:<8} {exact_energies[i]:<15.8f} {sdp_lbs[i]:<15.8f} "
+              f"{gap[i]:<15.8e} {gap[i]/N:<15.8e}")
+    print("=" * 80)
+    
+    return {
+        "N": Ns_arr,
+        "exact_energies": exact_energies,
+        "sdp_lbs": sdp_lbs,
+        "gap": gap,
+    }
+
+
+def plot_heisenberg_j2_vs_coupling(
+    N: int,
+    J2_values,
+    boundary: str = "periodic",
+    solver: str = "MOSEK",
+    mosek_tol: float = 1e-9,
+    per_site: bool = True,
+) -> Dict:
+    """
+    Plot ground state energy vs J2 for Heisenberg chain with second-neighbor couplings (case C).
+    
+    Compares exact diagonalization with SDP lower bound using the appropriate basis
+    for weak (J2 <= 1) and strong (J2 > 1) regimes.
+    
+    Args:
+        N: Number of spins
+        J2_values: Iterable of J2 values to evaluate
+        boundary: "open" or "periodic" (paper uses periodic)
+        solver: default "MOSEK"
+        mosek_tol: MOSEK conic tolerance
+        per_site: if True, plot E/N instead of E
+        
+    Returns:
+        Dict with exact energies, SDP lower bounds, and gap for each J2
+    """
+    from spins_sdp import heisenberg_j2_hamiltonian
+    from spins_sdp.basis_builder import generate_heisenberg_j2_basis_weak, generate_heisenberg_j2_basis_strong
+    
+    J2_values = np.array(list(J2_values))
+    exact_energies = []
+    sdp_lbs = []
+    
+    # Compute exact and SDP lower bound for each J2
+    for J2 in J2_values:
+        # print(f"Computing for J2 = {J2:.3f}...")
+        
+        # Exact ground state energy
+        H = heisenberg_j2_hamiltonian(N, J2=J2, boundary=boundary)
+        eigenvalues = H.eigenenergies()
+        E0 = float(eigenvalues[0])
+        exact_energies.append(E0)
+        # print(f"  Exact: {E0:.8f}")
+        
+        # Choose basis depending on J2 regime
+        if J2 <= 1.0:
+            basis = generate_heisenberg_j2_basis_weak(N=N)
+            basis_type = "weak"
+        else:
+            basis = generate_heisenberg_j2_basis_strong(N=N)
+            basis_type = "strong"
+        
+        operator = heisenberg_j2_operator(N=N, J2=J2, boundary=boundary)
+        
+        E_lb = solve_relaxation(
+            basis=basis,
+            operator=operator,
+            sense="min",
+            solver=solver,
+            mosek_tol=mosek_tol,
+            verbose=False,
+        )
+        sdp_lbs.append(E_lb)
+        # print(f"  SDP LB ({basis_type}): {E_lb:.8f}")
+    
+    exact_energies = np.array(exact_energies)
+    sdp_lbs = np.array(sdp_lbs)
+    
+    # Compute gap
+    gap = exact_energies - sdp_lbs
+    
+    # Choose what to plot
+    if per_site:
+        exact_plot = exact_energies / N
+        lb_plot = sdp_lbs / N
+        gap_plot = gap / N
+        ylabel = "Energy per site (E/N)"
+        ylabel_gap = "Gap per site (Exact - LB)/N"
+    else:
+        exact_plot = exact_energies
+        lb_plot = sdp_lbs
+        gap_plot = gap
+        ylabel = "Energy (E)"
+        ylabel_gap = "Gap (Exact - LB)"
+    
+    # Create figure with 2 subplots
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+    
+    # Plot 1: Energies vs J2
+    axes[0].plot(J2_values, exact_plot, marker="o", label="Exact ground energy", linewidth=2, markersize=8)
+    axes[0].plot(J2_values, lb_plot, marker="s", label="SDP lower bound", linewidth=2, markersize=8)
+    axes[0].axvline(x=1.0, color="gray", linestyle="--", alpha=0.5, label="J₂=1 (regime transition)")
+    axes[0].set_xlabel("Second-neighbor coupling $J_2$")
+    axes[0].set_ylabel(ylabel)
+    axes[0].set_title(f"Heisenberg Chain with $J_2$: Exact vs SDP (N={N})")
+    axes[0].grid(True, alpha=0.3)
+    axes[0].legend()
+    
+    # Plot 2: Gap vs J2
+    axes[1].plot(J2_values, gap_plot, marker="^", color="red", linewidth=2, markersize=8)
+    axes[1].axvline(x=1.0, color="gray", linestyle="--", alpha=0.5)
+    axes[1].set_xlabel("Second-neighbor coupling $J_2$")
+    axes[1].set_ylabel(ylabel_gap)
+    axes[1].set_title("Tightness of Relaxation: Gap")
+    axes[1].grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    plt.show()
+    
+    # Print summary
+    print("=" * 100)
+    print(f"Heisenberg Chain with J2 (Paper Case C) - N={N} - Exact vs SDP Comparison")
+    print("=" * 100)
+    print(f"{'J2':<10} {'Exact E':<15} {'SDP LB':<15} {'Gap':<15} {'Gap/N':<15} {'Regime':<15}")
+    print("-" * 100)
+    for i, J2 in enumerate(J2_values):
+        regime = "Weak (J2<=1)" if J2 <= 1.0 else "Strong (J2>1)"
+        print(f"{J2:<10.3f} {exact_energies[i]:<15.8f} {sdp_lbs[i]:<15.8f} "
+              f"{gap[i]:<15.8e} {gap[i]/N:<15.8e} {regime:<15}")
+    print("=" * 100)
+    
+    return {
+        "J2": J2_values,
+        "exact_energies": exact_energies,
+        "sdp_lbs": sdp_lbs,
+        "gap": gap,
+    }
+
+
+def plot_basis_size_comparison(
+    N_values,
+    npa_levels=[2, 3, 4],
+    include_paper_basis=True,
+    logy=True,
+) -> Dict[str, np.ndarray]:
+    """
+    Compare basis sizes of different NPA levels and the paper basis across N.
+    
+    Args:
+        N_values: Iterable of system sizes
+        npa_levels: List of NPA levels to plot (default: [2, 3, 4])
+        include_paper_basis: Whether to include Heisenberg paper basis
+        logy: Use log scale for y-axis
+        
+    Returns:
+        Dict with N and basis sizes for each method
+    """
+    Ns = np.array(list(N_values), dtype=int)
+    
+    result = {"N": Ns}
+    
+    # Compute NPA basis sizes
+    for level in npa_levels:
+        sizes = np.array([len(generate_npa_basis(N=N, k=level).words) for N in Ns])
+        result[f"NPA_{level}"] = sizes
+    
+    # Compute paper basis size
+    if include_paper_basis:
+        paper_sizes = np.array([len(generate_heisenberg_paper_basis(N=N)) for N in Ns])
+        result["paper"] = paper_sizes
+    
+    # Plot
+    plt.figure(figsize=(10, 6))
+    
+    for level in npa_levels:
+        plt.plot(Ns, result[f"NPA_{level}"], marker="o", label=f"NPA level {level}", linewidth=2)
+    
+    if include_paper_basis:
+        plt.plot(Ns, result["paper"], marker="s", label="Paper basis", linewidth=2, linestyle="--")
+    
+    if logy:
+        plt.yscale("log")
+    
+    plt.xlabel("Number of particles N")
+    plt.ylabel("Basis size")
+    
+    # Force the x-axis to use integers only
+    plt.gca().xaxis.set_major_locator(MaxNLocator(integer=True))
+    
+    plt.title("Basis size comparison: NPA levels vs Paper basis")
+    plt.grid(True, which="both", alpha=0.3)
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
+    
+    return result
+
+
 def plot_exact_vs_npa_energy_vs_N(
   N_values: range,
   J: float,
   h: float,
   k: float,
   NPA_level: int,
-  boundary: str = "open",
-  solver: str = "CVXOPT",
+  boundary: str = "periodic",
+  solver: str = "MOSEK",
+  solver_opts: Optional[Dict[str, Any]] = None,
   per_site: bool = False,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
   """
@@ -83,7 +397,11 @@ def plot_exact_vs_npa_energy_vs_N(
     exact_Es.append(float(E0))
 
     # NPA lower bound
-    E_lb = npa_lb_energy(J=J, h=h, k=k, N=N, NPA_level=NPA_level, solver=solver, boundary=boundary)
+    E_lb = npa_lb_energy(
+      J=J, h=h, k=k, N=N, NPA_level=NPA_level,
+      solver=solver, boundary=boundary,
+      solver_opts=solver_opts,
+    )
     npa_LBs.append(float(E_lb))
 
   exact_Es = np.array(exact_Es, dtype=float)

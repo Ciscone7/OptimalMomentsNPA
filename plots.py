@@ -393,7 +393,7 @@ def plot_exact_vs_npa_energy_vs_N(
   for N in Ns:
     # Exact
     H = ising_hamiltonian(N, J=J, h=h, k=k, boundary=boundary)
-    E0, _ = exact_ground_state_eigenpair(H)
+    E0 = H.eigenstates(eigvals=1)[0]
     exact_Es.append(float(E0))
 
     # NPA lower bound

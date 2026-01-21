@@ -104,7 +104,8 @@ def benchmark_exact_diagonalization(
     for idx, N in enumerate(Ns):
         def run():
             H = ising_hamiltonian(N, J=J, h=h, k=k, boundary=boundary)
-            E0, _ = exact_ground_state_eigenpair(H)
+            evals, _ = H.eigenstates(eigvals=1)
+            E0 = evals[0]
             return float(E0)
 
         E0, tb, ta = _time_best_avg(run, repeats=repeats)
@@ -308,6 +309,12 @@ def solve_relaxation(
     
     return float(sdp.problem.value)
 
+def optimization_wrapper_spins(x, starting_set, adding_set, hamiltonian_expression):
+
+    chosen_additions = [s for val, s in zip(x, adding_set) if val]
+    total_moments = starting_set + chosen_additions
+
+    return solve_relaxation(total_moments, hamiltonian_expression ,sense = "min")
 
 # ---------- General relaxation benchmark ----------
 def benchmark_relaxation(

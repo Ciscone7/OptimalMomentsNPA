@@ -215,15 +215,3 @@ def gibbs_state_from_spectrum(energies: Union[List[float], np.ndarray], eigensta
     # Build rho = sum_n p_n |n><n|
     rho = sum(p * qt.ket2dm(psi) for p, psi in zip(probabilities, eigenstates))
     return rho
-
-def exact_ground_state_eigenpair(H: qt.Qobj) -> Tuple[float, qt.Qobj]:
-    """Compute the exact ground state energy of a Hamiltonian by diagonalization.
-
-    Args:
-        H (np.ndarray): Hamiltonian matrix.
-
-    Returns:
-        float: Ground state energy.
-    """
-    evals, evecs = H.eigenstates(eigvals=1)  # just the lowest one
-    return (evals[0], evecs[0])

@@ -1,5 +1,7 @@
 from .exact import (
     ising_hamiltonian,
+    heisenberg_hamiltonian,
+    heisenberg_j2_hamiltonian,
     magnetization_qutip,
     gibbs_state_from_spectrum
 )

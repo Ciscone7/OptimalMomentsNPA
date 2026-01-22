@@ -20,6 +20,14 @@ class PauliNPABasis:
     levels: List[List[PauliWord]]
     min_len: Dict[PauliWord, int]
     index: Dict[PauliWord, int]
+    
+    def __repr__(self) -> str:
+        """
+        Return a string representation showing all basis words.
+        Format: PauliNPABasis(N=2, k=1, size=7): [I, X0, Y0, Z0, X1, Y1, Z1]
+        """
+        words_str = ", ".join(repr(w) for w in self.words)
+        return f"PauliNPABasis(N={self.N}, k={self.k}, size={len(self.words)}): [{words_str}]"
 
 
 def _pauli_atoms_xyz(N: int) -> List[PauliWord]:
@@ -101,7 +109,7 @@ def generate_npa_basis(N: int, k: int) -> PauliNPABasis:
 
     index = {w: i for i, w in enumerate(all_words_sorted)}
 
-    return NPABasis(
+    return PauliNPABasis(
         N=N,
         k=k,
         words=all_words_sorted,

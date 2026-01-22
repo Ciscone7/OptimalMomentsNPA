@@ -2,6 +2,8 @@ from collections.abc import Callable
 from time import time
 from typing import Any, List, Dict, Literal, Optional
 
+import numpy as np
+
 from spins_sdp.bell_algebra import generate_npa_basis
 from spins_sdp.pauli import Operator, PauliWord
 from spins_sdp.models import ising_hamiltonian_exact, ising_hamiltonian_dict

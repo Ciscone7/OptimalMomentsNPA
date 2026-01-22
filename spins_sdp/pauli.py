@@ -38,11 +38,58 @@ class PauliWord:
     def support_size(self) -> int:
         """Number of non-identity sites."""
         return (self.x_mask | self.z_mask).bit_count()
+    
+    def __repr__(self) -> str:
+        """
+        Return a string representation like 'X0Y1Z2' or 'I' for identity.
+        
+        Each non-identity operator is represented as a letter (X/Y/Z) followed by the qubit index.
+        """
+        if self.x_mask == 0 and self.z_mask == 0:
+            return "I"
+        
+        parts = []
+        # Find the highest bit set to determine range
+        max_bit = max(self.x_mask.bit_length(), self.z_mask.bit_length())
+        
+        for i in range(max_bit):
+            bit = 1 << i
+            x_bit = (self.x_mask & bit) != 0
+            z_bit = (self.z_mask & bit) != 0
+            
+            if x_bit and z_bit:
+                parts.append(f"Y{i}")
+            elif x_bit:
+                parts.append(f"X{i}")
+            elif z_bit:
+                parts.append(f"Z{i}")
+        
+        return "".join(parts) if parts else "I"
 
 @dataclass(frozen=True, slots=True)
 class PauliTerm:
     coeff: complex
     word: PauliWord
+    
+    def __repr__(self) -> str:
+        """
+        Return a string representation like 'X0Y1', '-Z0Z1', 'i*X0', or '-i*Y1'.
+        
+        Coefficient is always a phase factor: 1, -1, i, or -i.
+        """
+        word_str = repr(self.word)
+        
+        if self.coeff == 1+0j:
+            return word_str
+        elif self.coeff == -1+0j:
+            return f"-{word_str}"
+        elif self.coeff == 1j:
+            return f"i*{word_str}"
+        elif self.coeff == -1j:
+            return f"-i*{word_str}"
+        else:
+            # Fallback (shouldn't happen for proper Pauli terms)
+            return f"({self.coeff})*{word_str}"
 
 @dataclass(frozen=True, slots=True)
 class PauliMomentMatrixRep:

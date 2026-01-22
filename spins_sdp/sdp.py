@@ -1,315 +1,181 @@
-import cvxpy as cp
+# This whole file will be generalised later when we add the bell scenario
+
+from __future__ import annotations
+from dataclasses import dataclass
+from typing import Any, Dict, List, Literal, Optional
+
 import numpy as np
-import re
-from typing import Dict, List, Tuple, Any, Optional, Union, Literal
+import cvxpy as cp
+import scipy.sparse as sp
 
-from .pauli_strings import (
-    pauli_normal_form,
-    multiply_moments,
-    dagger,
-    op_from_word,
-    op_add,
-    op_scalar_mul,
-    op_multiply,
-    OperatorDict,
-    PauliString
-)
+from spins_sdp.pauli import compile_moment_matrix_rep, Operator, PauliMomentMatrixRep, PauliWord
 
-BoundaryType = Literal["open", "periodic"]
-# Type alias for CVXPY expression
-CvxExpr = Union[cp.Expression, float, complex, int]
-LabelToExpr = Dict[str, CvxExpr]
 
-def average_magnetization(axis: str, N: int, label_to_expr: LabelToExpr) -> CvxExpr:
+# Later we will generalise this to account for the bell scenario
+@dataclass(frozen=True, slots=True)
+class PauliMomentSDP:
+    rep: PauliMomentMatrixRep
+    y: cp.Variable
+    M_real: cp.Expression
+    M_imag: cp.Expression
+    PSD_block: cp.Expression
+    constraints: List[cp.Constraint]
+    objective: cp.Expression
+    problem: cp.Problem
+
+
+Sense = Literal["min", "max"]
+
+
+def pauli_moment_matrix_real_embedding(rep: PauliMomentMatrixRep, y: cp.Variable
+                                       ) -> tuple[cp.Expression, cp.Expression, cp.Expression]:
     """
-    Return the average magnetization along a given axis ('x', 'y', or 'z')
-    as a CVXPY expression.
+    Build M = A + iB where A,B are real matrices affine in y (y real),
+    then build the real embedding PSD matrix:
+        K = [[A, -B],
+             [B,  A]]  >= 0
     """
-    if axis not in ("x", "y", "z"):
-        raise ValueError("axis must be 'x', 'y', or 'z'")
+    n = rep.label_idx.shape[0]
+    m = len(rep.labels)
 
-    mag = 0
-    for i in range(N):
-        lbl = f"{axis}{i}"
-        if lbl in label_to_expr:
-            mag += label_to_expr[lbl]
-        # if not present (e.g. at a low NPA level), we just skip it
+    cols = rep.label_idx.reshape(-1, order="F").astype(np.int32)
+    dataA = rep.a_coef.reshape(-1, order="F").astype(float)
+    dataB = rep.b_coef.reshape(-1, order="F").astype(float)
+    rows = np.arange(n * n, dtype=np.int32)
 
-    return mag / N
+    CA = sp.coo_matrix((dataA, (rows, cols)), shape=(n * n, m)).tocsr()
+    CB = sp.coo_matrix((dataB, (rows, cols)), shape=(n * n, m)).tocsr()
 
-def ising_pauli_symbolic_terms(N: int, J: float, h: float, k: float, boundary: BoundaryType) -> OperatorDict:
+    A_vec = cp.Constant(CA) @ y
+    B_vec = cp.Constant(CB) @ y
+
+    # Explicit order matching column-major flattening
+    A = cp.reshape(A_vec, (n, n), order="F")
+    B = cp.reshape(B_vec, (n, n), order="F")
+
+    K = cp.bmat([[A, -B],
+                 [B,  A]])
+    return A, B, K
+
+
+def compile_operator_linear_form(rep: PauliMomentMatrixRep, op: Operator, *, tol: float = 1e-12
+                                 ) -> np.ndarray:
     """
-    Return the Ising Hamiltonian as a dictionary of Pauli-word coefficients.
-    
-    H = -J Σ_i σ_i^z σ_{i+1}^z - h Σ_i σ_i^x - k Σ_i σ_i^z
-    
-    Returns:
-        H_terms: Mapping from Pauli-word strings (like 'x0', 'z0z1') to coefficients (floats).
+    Compile <op> = sum_u c_u <u> into a real coefficient vector c over y,
+    assuming y_u = <u> are real (u Hermitian Pauli words).
+
+    For a Hermitian operator expressed in Pauli words, coefficients should be real.
+    We allow small imaginary parts (numerical noise) and drop them; otherwise we raise.
     """
-    H_terms: OperatorDict = {}
+    m = len(rep.labels)
+    c = np.zeros(m, dtype=float)
 
-    # -J Σ_i σ_i^z σ_{i+1}^z
-    for i in range(N):
-        if i < N - 1 or boundary == "periodic":
-            w = f"z{i}z{(i+1) % N}"
-            H_terms[w] = H_terms.get(w, 0) - J
+    for u, coef in op.items():
+        if abs(coef.imag) > tol:
+            raise ValueError(f"Operator coefficient for {u} has significant imaginary part: {coef}")
+        if u not in rep.label_index:
+            raise KeyError(f"Operator contains label not present in rep.labels: {u}")
+        c[rep.label_index[u]] += float(coef.real)
 
-    # -h Σ_i σ_i^x
-    for i in range(N):
-        w = f"x{i}"
-        H_terms[w] = H_terms.get(w, 0) - h
+    return c
 
-    # -k Σ_i σ_i^z
-    for i in range(N):
-        w = f"z{i}"
-        H_terms[w] = H_terms.get(w, 0) - k
 
-    return H_terms
-
-def moment_matrix_dict(relaxation: List[PauliString]) -> Dict[Tuple[int, int], Tuple[complex, str]]:
+def build_sdp_from_rep(rep: PauliMomentMatrixRep,
+                       objective_op: Operator,
+                       *,
+                       sense: Sense = "min",
+                       extra_constraints: Optional[List[cp.Constraint]] = None
+                       ) -> MomentSDP:
     """
-    Construct the symbolic moment matrix from a list of Pauli strings.
-    Returns a dict mapping (i,j) -> (coeff, label).
+    Build and return a CVXPY+MOSEK-ready SDP:
+      optimize  <objective_op>  subject to  M >= 0  and y_I=1.
+
+    - Moments y_u are modeled as real variables.
+    - The complex PSD constraint is imposed via the real embedding block matrix.
     """
-    moments = []
-    for string in relaxation:
-        moments.append(pauli_normal_form(string))
-    
-    M_dict = {}
-    for i in range(len(moments)):
-        for j in range(len(moments)):
-            M_dict[(i,j)] = multiply_moments(dagger(moments[i]), moments[j])
+    m = len(rep.labels)
+    y = cp.Variable(m, name="y")  # real vector of moments
 
-    return M_dict
+    A, B, K = pauli_moment_matrix_real_embedding(rep, y)
 
-def dict_to_cvxpy_matrix_from_expr(M_dict: Dict[Tuple[int, int], Tuple[complex, str]], label_to_expr: LabelToExpr) -> cp.Expression:
-    """
-    Convert the symbolic moment matrix dict into a CVXPY matrix expression.
-    
-    M_dict: (i,j) -> (coef, label) from moment_matrix_dict
-    label_to_expr: dict mapping each Pauli word 'label' -> CVXPY Expression
-    """
-    if not M_dict:
-        return np.array([[]]) # empty matrix
+    constraints: List[cp.Constraint] = []
+    # Normalization: <I> = 1
+    constraints.append(y[rep.idx_I] == 1.0)
 
-    rows = max(i for (i, j) in M_dict.keys()) + 1
-    cols = max(j for (i, j) in M_dict.keys()) + 1
+    # PSD constraint
+    constraints.append(K >> 0)
 
-    M_entries = [[0 for _ in range(cols)] for _ in range(rows)]
+    # Any additional linear constraints
+    if extra_constraints:
+        constraints.extend(extra_constraints)
 
-    for (i, j), (coef, label) in M_dict.items():
-        if label not in label_to_expr:
-             # If the label is not found, it implies it wasn't created as a variable.
-             # This might happen if the npa level is low but higher moments appear?
-             # Usually label_to_expr should contain everything needed if built correctly.
-             # However, for robustness, we can assume 0 or raise error?
-             # Based on notebook logic, it assumes it exists.
-             pass
-        
-        expr = coef * label_to_expr[label]  # label_to_expr[label] is affine
-        M_entries[i][j] = expr
+    # Objective: <objective_op> = c @ y
+    c = compile_operator_linear_form(rep, objective_op)
+    obj_expr = c @ y  # real scalar
 
-    return cp.bmat(M_entries)
+    objective = cp.Minimize(obj_expr) if sense == "min" else cp.Maximize(obj_expr)
+    problem = cp.Problem(objective, constraints)
 
-def build_sdp_variables(x: cp.Variable, z: cp.Variable, zz: cp.Variable, 
-                        all_labels: List[str], boundary: str, N: int) -> Tuple[LabelToExpr, Dict[str, cp.Variable]]:
-    """
-    Map each label -> CVXPY expression (x[i], z[i], zz[b], or new scalar var).
-    
-    Returns:
-        label_to_expr: complete mapping
-        extra_moments: dict of new variables created for higher moments
-    """
-    label_to_expr: LabelToExpr = {}
-    extra_moments: Dict[str, cp.Variable] = {}
-
-    for label in all_labels:
-        # Identity
-        if label == "I":
-            label_to_expr[label] = 1
-            continue
-
-        # Single-site x_i
-        m = re.fullmatch(r"x(\d+)", label)
-        if m:
-            i = int(m.group(1))
-            if 0 <= i < N:
-                label_to_expr[label] = x[i]
-                continue
-
-        # Single-site z_i
-        m = re.fullmatch(r"z(\d+)", label)
-        if m:
-            i = int(m.group(1))
-            if 0 <= i < N:
-                label_to_expr[label] = z[i]
-                continue
-
-        # Two-site z_i z_j
-        m = re.fullmatch(r"z(\d+)z(\d+)", label)
-        if m:
-            i = int(m.group(1))
-            j = int(m.group(2))
-
-            if boundary == "open":
-                # bonds (0,1), (1,2), ..., (N-2,N-1)
-                # assuming ordered i<j, but pauli_normal_form orders them.
-                # if j = i+1
-                if j == i + 1 and 0 <= i < N - 1:
-                    label_to_expr[label] = zz[i]
-                    continue
-            else:  # periodic
-                # standard neighbors
-                if j == i + 1 and 0 <= i < N - 1:
-                    label_to_expr[label] = zz[i]
-                    continue
-                # wrap-around bond (N-1,0) -> "z0z(N-1)" or "z(N-1)z0"?
-                # Sorted order means "z0 z(N-1)" is likely "z0z{N-1}" if N-1 > 0.
-                # Actually pauli_normal_form sorts by index.
-                # So "z(N-1) z0" -> "z0 z(N-1)"
-                # If i=0, j=N-1
-                if i == 0 and j == N - 1:
-                     label_to_expr[label] = zz[N - 1]
-                     continue
-
-        # If we reach here, this label is some other moment
-        v = cp.Variable(name=f"m_{label}")  # real scalar variable
-        extra_moments[label] = v
-        label_to_expr[label] = v
-        
-    return label_to_expr, extra_moments
-
-def ising_energy_expr(J, h, k, boundary, x, z, zz) -> cp.Expression:
-    """
-    Linearized Ising energy expression.
-    H = -J Sum zz - h Sum x - k Sum z
-    """
-    # energy = -J * cp.sum(zz) - h * cp.sum(x) - k * cp.sum(z)
-    # Be careful with sum dimensions if variables are not full vectors
-    return -J * cp.sum(zz) - h * cp.sum(x) - k * cp.sum(z)
-
-def op_expectation_expr(op_terms: OperatorDict, label_to_expr: LabelToExpr) -> cp.Expression:
-    """
-    Given an operator as a dict {word: coeff}, build the CVXPY expression
-    for its expectation value: sum_word coeff * <word>.
-    """
-    expr = 0
-    for word, c in op_terms.items():
-        if word not in label_to_expr:
-            raise KeyError(f"Pauli word '{word}' not in label_to_expr.")
-        expr += c * label_to_expr[word]
-    # Ensure it's a scalar expression (sum can return scalar?)
-    return expr
-
-def commutator_expectation_expr(H_terms: OperatorDict, a_label: str, label_to_expr: LabelToExpr) -> cp.Expression:
-    """
-    Build the CVXPY expression for <[H, a]>.
-    """
-    coeffs: OperatorDict = {}
-
-    for w_H, c_H in H_terms.items():
-        # H a
-        phase1, w1 = pauli_normal_form(w_H + a_label)
-        # a H
-        phase2, w2 = pauli_normal_form(a_label + w_H)
-
-        # [H,a] = H a - a H
-        coeffs[w1] = coeffs.get(w1, 0) + c_H * phase1
-        coeffs[w2] = coeffs.get(w2, 0) - c_H * phase2
-
-    return op_expectation_expr(coeffs, label_to_expr)
-
-
-def build_diagonality_constraints(H_terms: OperatorDict, h_labels: List[str], label_to_expr: LabelToExpr) -> List[cp.Constraint]:
-    """
-    Build constraints <[H, h_i h_j^dag]> = 0.
-    """
-    constraints = []
-
-    for i, hi in enumerate(h_labels):
-        for j, hj in enumerate(h_labels):
-            # For Pauli strings, h_j^dag = h_j.
-            # a = h_i h_j^dag
-            phase, a_word = pauli_normal_form(hi + hj)
-
-            # [H, a]
-            comm_expr_word = commutator_expectation_expr(H_terms, a_word, label_to_expr)
-            comm_expr = phase * comm_expr_word
-
-            constraints.append(comm_expr == 0)
-
-    return constraints
-
-
-def lambda_entry_expr(beta: float, Delta: float, H_terms: OperatorDict, 
-                      h_j_label: str, h_k_label: str, label_to_expr: LabelToExpr) -> cp.Expression:
-    """
-    Build the CVXPY expression for Lambda_{jk}(beta, Delta).
-    """
-    # Represent basis operators and H as dicts
-    h_j     = op_from_word(h_j_label)
-    h_k     = op_from_word(h_k_label)
-    h_j_dag = h_j      # Pauli strings are Hermitian
-    h_k_dag = h_k
-    H_op    = H_terms  # dict word -> coeff
-
-    # hh_dag and h_dag_h (for Pauli strings, they coincide up to canonical normalization)
-    h_j_h_k_dag = op_multiply(h_j, h_k_dag)   # h_j h_k+
-    h_j_dag_h_k = op_multiply(h_j_dag, h_k)   # h_j+ h_k
-
-    # 1) h_j H h_k+
-    term1 = op_multiply(op_multiply(h_j, H_op), h_k_dag)
-
-    # 2) -1/2 { h_j h_k+ , H }
-    hhH  = op_multiply(h_j_h_k_dag, H_op)
-    Hhh  = op_multiply(H_op, h_j_h_k_dag)
-    anticomm1 = op_add(hhH, Hhh)          # (hh+)H + H(hh+)
-    term2 = op_scalar_mul(anticomm1, -0.5)
-
-    # First bracket:
-    op_br1 = op_add(term1, term2)
-
-    # 3) h_j+ H h_k
-    term3 = op_multiply(op_multiply(h_j_dag, H_op), h_k)
-
-    # 4) -1/2 { h_j+ h_k , H }
-    hdagh  = h_j_dag_h_k
-    hdaghH = op_multiply(hdagh, H_op)
-    Hhdagh = op_multiply(H_op, hdagh)
-    anticomm2 = op_add(hdaghH, Hhdagh)
-    term4 = op_scalar_mul(anticomm2, -0.5)
-
-    # Second bracket:
-    op_br2 = op_add(term3, term4)
-
-    # 5) Delta( h_j h_k+ - e^{-beta Delta} h_j+ h_k )
-    exp_factor = np.exp(-beta * Delta)
-    op_br3_inner = op_add(h_j_h_k_dag,
-                          op_scalar_mul(h_j_dag_h_k, -exp_factor))
-    op_br3 = op_scalar_mul(op_br3_inner, Delta)
-
-    # Combine all pieces:
-    op_total = op_add(
-        op_add(op_br1, op_scalar_mul(op_br2, exp_factor)),
-        op_br3
+    return PauliMomentSDP(
+        rep=rep,
+        y=y,
+        M_real=A,
+        M_imag=B,
+        PSD_block=K,
+        constraints=constraints,
+        objective=obj_expr,
+        problem=problem,
     )
 
-    # Finally, expectation value:
-    return op_expectation_expr(op_total, label_to_expr)
 
-
-def build_lambda_matrix(beta: float, Delta: float, H_terms: OperatorDict, 
-                        h_labels: List[str], label_to_expr: LabelToExpr) -> cp.Expression:
+def solve_pauli_relaxation(
+    basis: List[PauliWord],
+    operator: Operator,
+    sense: Literal["min", "max"] = "min",
+    solver: str = "MOSEK",
+    mosek_tol: float = 1e-9,
+    solver_opts: Optional[Dict[str, Any]] = None,
+    verbose: bool = False,
+) -> float:
     """
-    Construct the matrix Lambda(beta, Delta).
+    Solve a moment relaxation SDP for a given basis and operator.
+    
+    Args:
+        basis: List of Pauli words defining the relaxation basis
+        operator: Objective operator as a Pauli word dictionary
+        sense: "min" or "max" optimization
+        solver: default "MOSEK"
+        mosek_tol: MOSEK conic tolerance
+        solver_opts: Override default solver options
+        verbose: Print solver output
+        
+    Returns:
+        Optimal objective value
     """
-    m = len(h_labels)
-    entries = [[0 for _ in range(m)] for _ in range(m)]
+    
+    rep = compile_moment_matrix_rep(basis)
+    
+    # Build SDP
+    sdp = build_sdp_from_rep(rep, operator, sense=sense)
+    
+    # Default MOSEK options
+    default_solver_opts: Dict[str, Any] = {
+        "mosek_params": {
+            "MSK_DPAR_INTPNT_CO_TOL_REL_GAP": mosek_tol,
+            "MSK_DPAR_INTPNT_CO_TOL_PFEAS": mosek_tol,
+            "MSK_DPAR_INTPNT_CO_TOL_DFEAS": mosek_tol,
+        }
+    }
+    
+    merged_solver_opts = dict(default_solver_opts)
+    if solver_opts:
+        merged_solver_opts.update(solver_opts)
+    
+    # Solve
+    sdp.problem.solve(solver=solver, verbose=verbose, **merged_solver_opts)
+    
+    return float(sdp.problem.value)
 
-    for j, h_j_label in enumerate(h_labels):
-        for k, h_k_label in enumerate(h_labels):
-            entries[j][k] = lambda_entry_expr(
-                beta, Delta, H_terms, h_j_label, h_k_label, label_to_expr
-            )
 
-    return cp.bmat(entries)
+
+

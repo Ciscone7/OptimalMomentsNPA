@@ -1,9 +1,28 @@
 from __future__ import annotations
-from typing import Final, Iterable, Dict, List, Literal, Set, Tuple, Optional
+from dataclasses import dataclass
+from typing import Dict, List, Set, Tuple, Optional
 
-from spins_sdp.pauli_strings_new import *
+from spins_sdp.pauli import PauliWord, multiply_words, local_pauli, reduce_monomial
 
-def _atoms_xyz(N: int) -> List[PauliWord]:
+@dataclass(frozen=True, slots=True)
+class PauliNPABasis:
+    """
+    Canonical unique basis up to level k (shortest-length representatives).
+
+    words:      all unique words reachable by <= k generator multiplications
+    levels:     levels[ℓ] are the words whose minimal length is exactly ℓ
+    min_len:    minimal length at which each word appears
+    index:      word -> index in `words` (deterministic ordering)
+    """
+    N: int
+    k: int
+    words: List[PauliWord]
+    levels: List[List[PauliWord]]
+    min_len: Dict[PauliWord, int]
+    index: Dict[PauliWord, int]
+
+
+def _pauli_atoms_xyz(N: int) -> List[PauliWord]:
     """
     Atomic generators in a fixed deterministic order: x0,y0,z0,x1,y1,z1,...,x(N-1),y(N-1),z(N-1).
     """
@@ -17,8 +36,7 @@ def _atoms_xyz(N: int) -> List[PauliWord]:
         atoms.append(PauliWord(0, bit))     # Z_i
     return atoms
 
-
-def generate_npa_basis(N: int, k: int) -> NPABasis:
+def generate_npa_basis(N: int, k: int) -> PauliNPABasis:
     """
     Generate the canonical unique basis up to level k.
 
@@ -42,7 +60,7 @@ def generate_npa_basis(N: int, k: int) -> NPABasis:
         raise ValueError("N must be >= 1.")
 
     I = PauliWord(0, 0)
-    atoms = _atoms_xyz(N)
+    atoms = _pauli_atoms_xyz(N)
 
     # BFS structures
     levels: List[List[PauliWord]] = [[] for _ in range(k + 1)]
@@ -91,6 +109,7 @@ def generate_npa_basis(N: int, k: int) -> NPABasis:
         min_len=min_len,
         index=index,
     )
+
 
 
 def _paper_default_r(N: int) -> int:
@@ -202,7 +221,6 @@ def generate_heisenberg_paper_basis(
 
     return out
 
-
 def generate_heisenberg_j2_basis_weak(
     N: int,
     *,
@@ -239,7 +257,6 @@ def generate_heisenberg_j2_basis_weak(
         include_degree3=include_degree3,
         include_degree4=include_degree4
     )
-
 
 def generate_heisenberg_j2_basis_strong(
     N: int,

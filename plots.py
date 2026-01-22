@@ -6,7 +6,7 @@ import matplotlib.pyplot as plt
 from tools import *
 
 from spins_sdp.basis_builder import generate_npa_basis, generate_heisenberg_paper_basis
-from spins_sdp.exact import ising_hamiltonian
+from spins_sdp.exact_old import ising_hamiltonian
 
 
 def npa_basis_size_heatmap(N: int, max_NPA_level: int) -> np.ndarray:

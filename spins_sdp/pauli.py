@@ -1,10 +1,9 @@
 from __future__ import annotations
 from dataclasses import dataclass
-from typing import Final, Iterable, Dict, List, Literal, Sequence, Tuple, Optional
+from typing import Final, Dict, List, Literal, Sequence, Tuple
 
 import numpy as np
-import cvxpy as cp
-import scipy.sparse as sp
+
 
 PhaseExp = int  # always interpreted mod 4
 
@@ -46,25 +45,7 @@ class PauliTerm:
     word: PauliWord
 
 @dataclass(frozen=True, slots=True)
-class NPABasis:
-    """
-    Canonical unique basis up to level k (shortest-length representatives).
-
-    words:      all unique words reachable by <= k generator multiplications
-    levels:     levels[ℓ] are the words whose minimal length is exactly ℓ
-    min_len:    minimal length at which each word appears
-    index:      word -> index in `words` (deterministic ordering)
-    """
-    N: int
-    k: int
-    words: List[PauliWord]
-    levels: List[List[PauliWord]]
-    min_len: Dict[PauliWord, int]
-    index: Dict[PauliWord, int]
-
-
-@dataclass(frozen=True, slots=True)
-class MomentMatrixRep:
+class PauliMomentMatrixRep:
     """
     Represents M_ij = (a_coef_ij + i b_coef_ij) * y[label_idx_ij],
     where y[...] are real moment variables y_u = <u>.
@@ -77,21 +58,7 @@ class MomentMatrixRep:
     b_coef: np.ndarray                     # (n,n) int8: Im coefficient in { -1,0,1 }
     idx_I: int                             # index of identity label
 
-
-@dataclass(frozen=True, slots=True)
-class MomentSDP:
-    rep: MomentMatrixRep
-    y: cp.Variable
-    M_real: cp.Expression
-    M_imag: cp.Expression
-    PSD_block: cp.Expression
-    constraints: List[cp.Constraint]
-    objective: cp.Expression
-    problem: cp.Problem
-
-
 Operator = Dict[PauliWord, complex]
-Sense = Literal["min", "max"]
 
 
 def multiply_words(a: PauliWord, b: PauliWord) -> tuple[PhaseExp, PauliWord]:
@@ -160,7 +127,8 @@ def local_pauli(site: int, axis: Axis) -> PauliWord:
     return PauliWord(bit, bit)
 
 
-def compile_moment_matrix_rep(basis: List[PauliWord]) -> MomentMatrixRep:
+
+def compile_moment_matrix_rep(basis: List[PauliWord]) -> PauliMomentMatrixRep:
     """
     Given basis monomials W=[w_i], build the compiled representation of the moment matrix:
       M_ij = <w_i^† w_j> = (known phase) * <u_ij>
@@ -220,7 +188,7 @@ def compile_moment_matrix_rep(basis: List[PauliWord]) -> MomentMatrixRep:
             a_coef[j, i] = re
             b_coef[j, i] = -im
 
-    return MomentMatrixRep(
+    return PauliMomentMatrixRep(
         basis=basis,
         labels=labels,
         label_index=label_index,
@@ -229,115 +197,6 @@ def compile_moment_matrix_rep(basis: List[PauliWord]) -> MomentMatrixRep:
         b_coef=b_coef,
         idx_I=idx_I,
     )
-
-
-def build_moment_matrix_real_embedding(rep: MomentMatrixRep, y: cp.Variable
-                                       ) -> tuple[cp.Expression, cp.Expression, cp.Expression]:
-    """
-    Build M = A + iB where A,B are real matrices affine in y (y real),
-    then build the real embedding PSD matrix:
-        K = [[A, -B],
-             [B,  A]]  >= 0
-    """
-    n = rep.label_idx.shape[0]
-    m = len(rep.labels)
-
-    cols = rep.label_idx.reshape(-1, order="F").astype(np.int32)
-    dataA = rep.a_coef.reshape(-1, order="F").astype(float)
-    dataB = rep.b_coef.reshape(-1, order="F").astype(float)
-    rows = np.arange(n * n, dtype=np.int32)
-
-    CA = sp.coo_matrix((dataA, (rows, cols)), shape=(n * n, m)).tocsr()
-    CB = sp.coo_matrix((dataB, (rows, cols)), shape=(n * n, m)).tocsr()
-
-    A_vec = cp.Constant(CA) @ y
-    B_vec = cp.Constant(CB) @ y
-
-    # Explicit order matching column-major flattening
-    A = cp.reshape(A_vec, (n, n), order="F")
-    B = cp.reshape(B_vec, (n, n), order="F")
-
-    K = cp.bmat([[A, -B],
-                 [B,  A]])
-    return A, B, K
-
-
-def compile_operator_linear_form(rep: MomentMatrixRep, op: Operator, *, tol: float = 1e-12
-                                 ) -> np.ndarray:
-    """
-    Compile <op> = sum_u c_u <u> into a real coefficient vector c over y,
-    assuming y_u = <u> are real (u Hermitian Pauli words).
-
-    For a Hermitian operator expressed in Pauli words, coefficients should be real.
-    We allow small imaginary parts (numerical noise) and drop them; otherwise we raise.
-    """
-    m = len(rep.labels)
-    c = np.zeros(m, dtype=float)
-
-    for u, coef in op.items():
-        if abs(coef.imag) > tol:
-            raise ValueError(f"Operator coefficient for {u} has significant imaginary part: {coef}")
-        if u not in rep.label_index:
-            raise KeyError(f"Operator contains label not present in rep.labels: {u}")
-        c[rep.label_index[u]] += float(coef.real)
-
-    return c
-
-
-def build_sdp_from_rep(rep: MomentMatrixRep,
-                       objective_op: Operator,
-                       *,
-                       sense: Sense = "min",
-                       extra_constraints: Optional[List[cp.Constraint]] = None
-                       ) -> MomentSDP:
-    """
-    Build and return a CVXPY+MOSEK-ready SDP:
-      optimize  <objective_op>  subject to  M >= 0  and y_I=1.
-
-    - Moments y_u are modeled as real variables.
-    - The complex PSD constraint is imposed via the real embedding block matrix.
-    """
-    m = len(rep.labels)
-    y = cp.Variable(m, name="y")  # real vector of moments
-
-    A, B, K = build_moment_matrix_real_embedding(rep, y)
-
-    constraints: List[cp.Constraint] = []
-    # Normalization: <I> = 1
-    constraints.append(y[rep.idx_I] == 1.0)
-
-    # PSD constraint
-    constraints.append(K >> 0)
-
-    # Any additional linear constraints
-    if extra_constraints:
-        constraints.extend(extra_constraints)
-
-    # Objective: <objective_op> = c @ y
-    c = compile_operator_linear_form(rep, objective_op)
-    obj_expr = c @ y  # real scalar
-
-    objective = cp.Minimize(obj_expr) if sense == "min" else cp.Maximize(obj_expr)
-    problem = cp.Problem(objective, constraints)
-
-    return MomentSDP(
-        rep=rep,
-        y=y,
-        M_real=A,
-        M_imag=B,
-        PSD_block=K,
-        constraints=constraints,
-        objective=obj_expr,
-        problem=problem,
-    )
-
-
-
-
-
-
-
-
 
 
 

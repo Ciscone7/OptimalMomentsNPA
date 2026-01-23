@@ -216,10 +216,9 @@ def Y(i: int) -> PauliWord:
     return PauliWord(b, b)
 
 
-
+# --- Optimization ---
 
 def optimization_wrapper_spins(x, starting_set, adding_set, hamiltonian_expression):
-  
     chosen_additions = [s for val, s in zip(x, adding_set) if val]
     total_moments = starting_set + chosen_additions
 

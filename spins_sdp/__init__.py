@@ -1,9 +1,14 @@
 from .exact_old import (
-    ising_hamiltonian,
-    heisenberg_hamiltonian,
-    heisenberg_j2_hamiltonian,
     magnetization_qutip,
     gibbs_state_from_spectrum
+)
+from .models import (
+    ising_hamiltonian_exact,
+    ising_hamiltonian_dict,
+    heisenberg_hamiltonian_exact,
+    heisenberg_hamiltonian_dict,
+    heisenberg_j2_hamiltonian_exact,
+    heisenberg_j2_hamiltonian_dict,
 )
 from .pauli_strings import npa_level
 from .sdp_old import (

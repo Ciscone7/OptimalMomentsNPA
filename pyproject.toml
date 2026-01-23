@@ -8,21 +8,33 @@ version = "0.1.0"
 description = "OptimalSDP Simulations"
 authors = [{name = "Francesco", email = "fflora@icfo.net"}]
 dependencies = [
+    # Core dependencies (required for basic functionality)
     "cvxpy",
-    "equinox",
-    "h5py",
-    "jax",
     "matplotlib",
     "numpy",
     "numpyencoder",
-    "optax",
     "pandas",
-    "scikit-learn",
     "scipy",
     "tqdm",
     "qutip",
-    "pillow"
+    "pillow",
 ]
+
+[project.optional-dependencies]
+# Bayesian optimization with random forests
+bayesian = ["scikit-learn"]
+
+# Restricted Boltzmann Machine sampler
+rbm = ["jax", "equinox", "optax"]
+
+# HDF5-based results storage
+hdf5 = ["h5py"]
+
+# Install all optional dependencies
+all = ["scikit-learn", "jax", "equinox", "optax", "h5py"]
+
+# Development dependencies
+dev = ["black", "ipykernel", "ipython", "jupyterlab", "mosek"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

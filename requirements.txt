@@ -3,6 +3,7 @@ equinox
 h5py
 jax
 matplotlib
+mosek
 numpy==2.3.0
 numpyencoder
 optax

@@ -9,6 +9,11 @@ Main plotting functions:
   - plot_heisenberg_j2_sweep: Heisenberg-J2 chain sweep over J2 values (paper Case C style)
   - plot_runtime_comparison: Compare solve times across methods/levels
 
+Optimization sweep plotting functions:
+  - plot_optimization_sweep: Plot best lower bound vs k for an optimization sweep
+  - plot_optimization_convergence: Plot how bounds improve with more monomials
+  - plot_optimization_seeds_comparison: Compare results across different seeds
+
 Utility functions:
   - npa_basis_size_heatmap: Visualize NPA basis size vs N and level
   - plot_basis_size_comparison: Compare basis sizes across methods
@@ -821,3 +826,842 @@ def plot_basis_size_comparison(
         plt.show()
 
     return result
+
+
+# =============================================================================
+# Optimization Sweep Plotting Functions
+# =============================================================================
+
+def _find_optimization_run_dir(
+    *,
+    results_root: Path,
+    run_hash: Optional[str] = None,
+    meta_query: Optional[Dict[str, Any]] = None,
+) -> Path:
+    """Find an optimization sweep run directory."""
+    return _find_run_dir(
+        results_root=results_root,
+        artifact="spin_optimization_sweep",
+        schema_version=1,
+        run_hash=run_hash,
+        meta_query=meta_query,
+    )
+
+
+def _load_optimization_data(run_dir: Path) -> Tuple[Dict[str, Any], Dict[str, np.ndarray]]:
+    """Load optimization sweep meta and data."""
+    meta = _load_meta(run_dir)
+    data = _load_npz(run_dir)
+    return meta, data
+
+
+def _compute_exact_ground_energy(
+    model: str,
+    N: int,
+    boundary: str,
+    model_params: Dict[str, float],
+) -> float:
+    """Compute exact ground state energy for a model."""
+    from spins_sdp import models
+    
+    if model == "ising":
+        H = models.ising_hamiltonian_exact(N, boundary=boundary, **model_params)
+    elif model == "heisenberg":
+        H = models.heisenberg_hamiltonian_exact(N, boundary=boundary)
+    elif model == "heisenberg_j2":
+        H = models.heisenberg_j2_hamiltonian_exact(N, boundary=boundary, **model_params)
+    else:
+        raise ValueError(f"Unknown model: {model}")
+    
+    eigenvalues = H.eigenenergies(eigvals=1)
+    return float(np.asarray(eigenvalues)[0])
+
+
+def _compute_full_relaxation_lower_bound(
+    *,
+    model: str,
+    N: int,
+    boundary: str,
+    model_params: Dict[str, float],
+    end_level: int,
+    solver: str,
+    mosek_tol: float,
+) -> float:
+    """Compute the SDP lower bound for the full relaxation (end_level basis).
+
+    This is used by convergence plots when the sweep did not include k=L.
+    """
+    from spins_sdp import models
+    from spins_sdp.sdp import solve_pauli_relaxation
+
+    if model == "ising":
+        H = models.ising_hamiltonian_dict(N=N, boundary=boundary, **model_params)
+    elif model == "heisenberg":
+        H = models.heisenberg_hamiltonian_dict(N=N, boundary=boundary)
+    elif model == "heisenberg_j2":
+        H = models.heisenberg_j2_hamiltonian_dict(N=N, boundary=boundary, **model_params)
+    else:
+        raise ValueError(f"Unknown model: {model}")
+
+    full_basis = generate_npa_basis(N=N, k=int(end_level)).words
+    lb = solve_pauli_relaxation(
+        full_basis,
+        H,
+        sense="min",
+        solver=solver,
+        mosek_tol=float(mosek_tol),
+        verbose=False,
+    )
+    return float(lb)
+
+
+def _get_exact_energy_from_artifact_or_compute(
+    model: str,
+    N: int,
+    boundary: str,
+    model_params: Dict[str, float],
+    results_root: Path,
+) -> Tuple[float, str]:
+    """Try to load exact energy from artifact, otherwise compute it.
+    
+    Returns:
+        (energy, source) where source is "artifact" or "computed"
+    """
+    try:
+        exact_query = {
+            "artifact": "spin_exact_ground_energy",
+            "schema_version": 1,
+            "model": model,
+            "boundary": boundary,
+        }
+        if model_params:
+            exact_query["params"] = {k: float(v) for k, v in model_params.items()}
+        
+        exact_run = _find_run_dir(
+            results_root=results_root,
+            artifact="spin_exact_ground_energy",
+            schema_version=1,
+            meta_query=exact_query,
+        )
+        
+        exact_npz = _load_npz(exact_run)
+        N_arr = np.asarray(exact_npz["N"], dtype=int)
+        E0_arr = np.asarray(exact_npz["E0"], dtype=float)
+        
+        # Find the matching N
+        idx = np.where(N_arr == N)[0]
+        if len(idx) > 0:
+            return float(E0_arr[idx[0]]), "artifact"
+    except FileNotFoundError:
+        pass
+    
+    # Fall back to computing
+    E0 = _compute_exact_ground_energy(model, N, boundary, model_params)
+    return E0, "computed"
+
+
+def plot_optimization_sweep(
+    *,
+    run_hash: Optional[str] = None,
+    model: Optional[str] = None,
+    N: Optional[int] = None,
+    boundary: str = "periodic",
+    model_params: Optional[Dict[str, float]] = None,
+    start_level: int = 1,
+    end_level: int = 2,
+    method: str = "sa",
+    exact_energy: Optional[float] = None,
+    results_root: Optional[Path] = None,
+    show_seeds: bool = False,
+    per_site: bool = False,
+    show: bool = True,
+    save_path: Optional[Path] = None,
+) -> Dict[str, Any]:
+    """Plot best lower bound vs number of added monomials (k) for an optimization sweep.
+    
+    This is the main plotting function for optimization results. It shows how the
+    SDP lower bound improves as more monomials are added to the basis.
+    
+    Args:
+        run_hash: Explicit hash of the optimization run directory.
+        model: Model name ("ising", "heisenberg", "heisenberg_j2").
+        N: Number of sites.
+        boundary: "periodic" or "open".
+        model_params: Model-specific parameters (e.g., {"J2": 0.5}).
+        start_level: NPA level for starting set.
+        end_level: NPA level for final set.
+        method: Optimization method ("sa" or "pt").
+        exact_energy: Exact ground state energy. If None, will try to load from
+                     artifact or compute it.
+        results_root: Override default results directory.
+        show_seeds: If True, show individual seed results as scatter points.
+        per_site: If True, plot energy per site.
+        show: Whether to call plt.show().
+        save_path: If provided, save figure to this path.
+    
+    Returns:
+        Dict with run info, data arrays, exact energy, and figure/axes.
+    
+    Example:
+        # By hash
+        plot_optimization_sweep(run_hash="270b29da020d10b0")
+        
+        # By parameters
+        plot_optimization_sweep(
+            model="heisenberg",
+            N=4,
+            boundary="periodic",
+            start_level=1,
+            end_level=2,
+            method="sa",
+        )
+    """
+    results_root = results_root or _default_results_root()
+    
+    # Build query if not using hash
+    meta_query = None
+    if run_hash is None:
+        if model is None or N is None:
+            raise ValueError("Provide either run_hash or (model, N)")
+        meta_query = {
+            "artifact": "spin_optimization_sweep",
+            "schema_version": 1,
+            "model": model,
+            "N": int(N),
+            "boundary": boundary,
+            "start_level": int(start_level),
+            "end_level": int(end_level),
+            "method": method,
+        }
+        if model_params:
+            meta_query["model_params"] = {k: float(v) for k, v in model_params.items()}
+    
+    # Find and load run
+    run_dir = _find_optimization_run_dir(
+        results_root=results_root,
+        run_hash=run_hash,
+        meta_query=meta_query,
+    )
+    
+    meta, data = _load_optimization_data(run_dir)
+    
+    # Extract info from meta
+    model = meta.get("model", model)
+    N = meta.get("N", N)
+    boundary = meta.get("boundary", boundary)
+    model_params = meta.get("model_params", model_params or {})
+    L = meta.get("L", meta.get("adding_set_size"))
+    starting_set_size = meta.get("starting_set_size", 0)
+    
+    # Get exact energy
+    E0_source = "provided"
+    if exact_energy is None:
+        exact_energy, E0_source = _get_exact_energy_from_artifact_or_compute(
+            model=model,
+            N=N,
+            boundary=boundary,
+            model_params=model_params,
+            results_root=results_root,
+        )
+    
+    # Extract data arrays
+    k_arr = data["k"]
+    best_value_arr = data["best_value"]
+    seed_arr = data.get("seed", np.zeros_like(k_arr))
+    
+    # Compute best value per k (across all seeds)
+    unique_ks = np.unique(k_arr)
+    best_per_k = {}
+    all_per_k = {}
+    
+    for k in unique_ks:
+        mask = k_arr == k
+        values = best_value_arr[mask]
+        best_per_k[int(k)] = float(np.max(values))
+        all_per_k[int(k)] = values
+    
+    ks_sorted = np.array(sorted(best_per_k.keys()))
+    best_vals = np.array([best_per_k[k] for k in ks_sorted])
+    
+    # Total basis size at each k
+    total_basis_size = starting_set_size + ks_sorted
+    
+    # Prepare plot values
+    if per_site:
+        E0_plot = exact_energy / N
+        best_vals_plot = best_vals / N
+        ylabel = "Energy per site (E/N)"
+    else:
+        E0_plot = exact_energy
+        best_vals_plot = best_vals
+        ylabel = "Energy"
+    
+    # --- Plotting ---
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+    
+    # Left plot: Lower bound vs k
+    ax1 = axes[0]
+    
+    # Plot best per k
+    ax1.plot(ks_sorted, best_vals_plot, marker="o", linewidth=2, markersize=6,
+             label="Best LB (optimization)", color="C0", zorder=3)
+    
+    # Optionally show all seeds
+    if show_seeds:
+        for k in unique_ks:
+            values = all_per_k[int(k)]
+            if per_site:
+                values = values / N
+            ax1.scatter([k] * len(values), values, alpha=0.3, s=20, color="C0", zorder=2)
+    
+    # Plot exact energy as horizontal line
+    ax1.axhline(E0_plot, color="red", linestyle="--", linewidth=2, 
+                label=f"Exact $E_0$ ({E0_source})", zorder=1)
+    
+    ax1.set_xlabel("Number of added monomials (k)")
+    ax1.set_ylabel(ylabel)
+    ax1.set_title(f"{model.capitalize()} N={N}: Lower Bound vs Added Monomials")
+    ax1.xaxis.set_major_locator(MaxNLocator(integer=True))
+    ax1.grid(True, alpha=0.3)
+    ax1.legend(loc="lower right")
+    
+    # Right plot: Gap (E0 - LB) vs k
+    ax2 = axes[1]
+    
+    gap = exact_energy - best_vals
+    if per_site:
+        gap_plot = gap / N
+        gap_ylabel = "Gap per site ($E_0$ - LB)/N"
+    else:
+        gap_plot = gap
+        gap_ylabel = "Gap ($E_0$ - LB)"
+    
+    ax2.plot(ks_sorted, gap_plot, marker="^", linewidth=2, markersize=6, color="green")
+    ax2.axhline(0, color="gray", linestyle=":", linewidth=1)
+    ax2.set_xlabel("Number of added monomials (k)")
+    ax2.set_ylabel(gap_ylabel)
+    ax2.set_title("Relaxation Gap")
+    ax2.xaxis.set_major_locator(MaxNLocator(integer=True))
+    ax2.grid(True, alpha=0.3)
+    
+    # Use log scale if all gaps are positive
+    if len(gap_plot) > 0 and np.all(gap_plot > 0):
+        ax2.set_yscale("log")
+    
+    plt.tight_layout()
+    
+    if save_path is not None:
+        plt.savefig(save_path)
+    if show:
+        plt.show()
+    
+    return {
+        "run_dir": run_dir,
+        "meta": meta,
+        "k": ks_sorted,
+        "best_values": best_vals,
+        "exact_energy": exact_energy,
+        "exact_energy_source": E0_source,
+        "gap": gap,
+        "L": L,
+        "starting_set_size": starting_set_size,
+        "figure": fig,
+        "axes": axes,
+    }
+
+
+def plot_optimization_convergence(
+    *,
+    run_hash: Optional[str] = None,
+    model: Optional[str] = None,
+    N: Optional[int] = None,
+    boundary: str = "periodic",
+    model_params: Optional[Dict[str, float]] = None,
+    start_level: int = 1,
+    end_level: int = 2,
+    method: str = "sa",
+    exact_energy: Optional[float] = None,
+    full_relaxation_energy: Optional[float] = None,
+    results_root: Optional[Path] = None,
+    show: bool = True,
+    save_path: Optional[Path] = None,
+) -> Dict[str, Any]:
+    """Plot optimization convergence: best LB vs fraction of monomials used.
+    
+    Shows how quickly the lower bound approaches the full relaxation value
+    as we add more monomials. Useful for understanding if a small subset
+    of monomials can achieve most of the improvement.
+    
+    Args:
+        run_hash: Explicit hash of the optimization run.
+        model, N, boundary, model_params: Model specification for lookup.
+        start_level, end_level: NPA levels for basis.
+        method: Optimization method.
+        exact_energy: Exact ground state energy (optional).
+        full_relaxation_energy: Energy with all monomials (k=L). If None,
+                               will try to extract from data.
+        results_root: Override default results directory.
+        show: Whether to call plt.show().
+        save_path: If provided, save figure.
+    
+    Returns:
+        Dict with convergence data and figure.
+    """
+    results_root = results_root or _default_results_root()
+    
+    # Build query
+    meta_query = None
+    if run_hash is None:
+        if model is None or N is None:
+            raise ValueError("Provide either run_hash or (model, N)")
+        meta_query = {
+            "artifact": "spin_optimization_sweep",
+            "model": model,
+            "N": int(N),
+            "boundary": boundary,
+            "start_level": int(start_level),
+            "end_level": int(end_level),
+            "method": method,
+        }
+        if model_params:
+            meta_query["model_params"] = {k: float(v) for k, v in model_params.items()}
+    
+    run_dir = _find_optimization_run_dir(
+        results_root=results_root,
+        run_hash=run_hash,
+        meta_query=meta_query,
+    )
+    
+    meta, data = _load_optimization_data(run_dir)
+    
+    model = meta.get("model", model)
+    N = meta.get("N", N)
+    boundary = meta.get("boundary", boundary)
+    model_params = meta.get("model_params", model_params or {})
+    end_level = int(meta.get("end_level", end_level))
+    L = meta.get("L", meta.get("adding_set_size"))
+    starting_set_size = meta.get("starting_set_size", 0)
+    
+    # Get exact energy
+    if exact_energy is None:
+        exact_energy, _ = _get_exact_energy_from_artifact_or_compute(
+            model=model, N=N, boundary=boundary,
+            model_params=model_params, results_root=results_root,
+        )
+    
+    # Extract data
+    k_arr = data["k"]
+    best_value_arr = data["best_value"]
+    
+    # Compute best per k
+    unique_ks = np.unique(k_arr)
+    best_per_k = {int(k): float(np.max(best_value_arr[k_arr == k])) for k in unique_ks}
+    
+    ks_sorted = np.array(sorted(best_per_k.keys()))
+    best_vals = np.array([best_per_k[k] for k in ks_sorted])
+    
+    # Get full relaxation energy (k=L). If the sweep didn't include k=L,
+    # compute the true full relaxation LB directly.
+    full_relaxation_label = "Full relaxation (k=L)"
+    if full_relaxation_energy is None:
+        if L in best_per_k:
+            full_relaxation_energy = best_per_k[L]
+            full_relaxation_label = "Full relaxation (k=L)"
+        else:
+            try:
+                full_relaxation_energy = _compute_full_relaxation_lower_bound(
+                    model=model,
+                    N=int(N),
+                    boundary=boundary,
+                    model_params=model_params,
+                    end_level=end_level,
+                    solver=str(meta.get("solver", "MOSEK")),
+                    mosek_tol=float(meta.get("mosek_tol", 1e-9)),
+                )
+                full_relaxation_label = "Full relaxation (k=L)"
+            except Exception:
+                full_relaxation_energy = best_vals[-1]
+                full_relaxation_label = f"Best available (k={int(ks_sorted[-1])})"
+    
+    # Starting energy (k=0)
+    starting_energy = best_per_k.get(0, best_vals[0])
+    
+    # Fraction of monomials
+    fraction = ks_sorted / L if L > 0 else ks_sorted
+    
+    # Normalized improvement: 0 at k=0, 1 at k=L
+    total_improvement = full_relaxation_energy - starting_energy
+    if abs(total_improvement) > 1e-12:
+        normalized = (best_vals - starting_energy) / total_improvement
+    else:
+        normalized = np.zeros_like(best_vals)
+    
+    # --- Plotting ---
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+    
+    # Left: Raw values vs fraction
+    ax1 = axes[0]
+    ax1.plot(fraction * 100, best_vals, marker="o", linewidth=2, label="Best LB")
+    ax1.axhline(exact_energy, color="red", linestyle="--", linewidth=2, label="Exact $E_0$")
+    ax1.axhline(
+        full_relaxation_energy,
+        color="green",
+        linestyle=":",
+        linewidth=2,
+        label=full_relaxation_label,
+    )
+    ax1.set_xlabel("Fraction of monomials added (%)")
+    ax1.set_ylabel("Energy")
+    ax1.set_title(f"{model.capitalize()} N={N}: Convergence")
+    ax1.grid(True, alpha=0.3)
+    ax1.legend()
+    
+    # Right: Normalized improvement
+    ax2 = axes[1]
+    ax2.plot(fraction * 100, normalized * 100, marker="o", linewidth=2, color="purple")
+    ax2.axhline(100, color="green", linestyle=":", linewidth=1)
+    ax2.set_xlabel("Fraction of monomials added (%)")
+    ax2.set_ylabel("% of total improvement achieved")
+    ax2.set_title("Relative Improvement")
+    ax2.set_ylim(-5, 105)
+    ax2.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    
+    if save_path is not None:
+        plt.savefig(save_path)
+    if show:
+        plt.show()
+    
+    return {
+        "run_dir": run_dir,
+        "k": ks_sorted,
+        "fraction": fraction,
+        "best_values": best_vals,
+        "normalized_improvement": normalized,
+        "exact_energy": exact_energy,
+        "full_relaxation_energy": full_relaxation_energy,
+        "starting_energy": starting_energy,
+        "L": L,
+        "figure": fig,
+        "axes": axes,
+    }
+
+
+def plot_optimization_seeds_comparison(
+    *,
+    run_hash: Optional[str] = None,
+    model: Optional[str] = None,
+    N: Optional[int] = None,
+    boundary: str = "periodic",
+    model_params: Optional[Dict[str, float]] = None,
+    start_level: int = 1,
+    end_level: int = 2,
+    method: str = "sa",
+    results_root: Optional[Path] = None,
+    show: bool = True,
+    save_path: Optional[Path] = None,
+) -> Dict[str, Any]:
+    """Plot comparison of results across different random seeds.
+    
+    Shows the variability in optimization results for each k value,
+    helping understand whether more seeds are needed for reliable results.
+    
+    Args:
+        Same as plot_optimization_sweep.
+    
+    Returns:
+        Dict with statistics and figure.
+    """
+    results_root = results_root or _default_results_root()
+    
+    meta_query = None
+    if run_hash is None:
+        if model is None or N is None:
+            raise ValueError("Provide either run_hash or (model, N)")
+        meta_query = {
+            "artifact": "spin_optimization_sweep",
+            "model": model,
+            "N": int(N),
+            "boundary": boundary,
+            "start_level": int(start_level),
+            "end_level": int(end_level),
+            "method": method,
+        }
+        if model_params:
+            meta_query["model_params"] = {k: float(v) for k, v in model_params.items()}
+    
+    run_dir = _find_optimization_run_dir(
+        results_root=results_root,
+        run_hash=run_hash,
+        meta_query=meta_query,
+    )
+    
+    meta, data = _load_optimization_data(run_dir)
+    
+    model = meta.get("model", model)
+    N = meta.get("N", N)
+    
+    k_arr = data["k"]
+    best_value_arr = data["best_value"]
+    seed_arr = data.get("seed", np.zeros_like(k_arr))
+    
+    # Compute statistics per k
+    unique_ks = np.unique(k_arr)
+    stats = {}
+    
+    for k in unique_ks:
+        mask = k_arr == k
+        values = best_value_arr[mask]
+        seeds = seed_arr[mask]
+        
+        stats[int(k)] = {
+            "min": float(np.min(values)),
+            "max": float(np.max(values)),
+            "mean": float(np.mean(values)),
+            "std": float(np.std(values)),
+            "range": float(np.max(values) - np.min(values)),
+            "n_seeds": len(values),
+            "values": values,
+            "seeds": seeds,
+        }
+    
+    ks_sorted = np.array(sorted(stats.keys()))
+    means = np.array([stats[k]["mean"] for k in ks_sorted])
+    stds = np.array([stats[k]["std"] for k in ks_sorted])
+    mins = np.array([stats[k]["min"] for k in ks_sorted])
+    maxs = np.array([stats[k]["max"] for k in ks_sorted])
+    
+    # --- Plotting ---
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+    
+    # Left: Mean ± std with min/max range
+    ax1 = axes[0]
+    ax1.fill_between(ks_sorted, mins, maxs, alpha=0.2, color="C0", label="Min-Max range")
+    ax1.fill_between(ks_sorted, means - stds, means + stds, alpha=0.4, color="C0", label="Mean ± std")
+    ax1.plot(ks_sorted, means, marker="o", linewidth=2, color="C0", label="Mean")
+    ax1.plot(ks_sorted, mins, marker="v", linewidth=1, linestyle=":", color="C0", alpha=0.7)
+    ax1.plot(ks_sorted, maxs, marker="^", linewidth=1, linestyle=":", color="C0", alpha=0.7)
+    
+    ax1.set_xlabel("Number of added monomials (k)")
+    ax1.set_ylabel("Energy")
+    ax1.set_title(f"{model.capitalize()} N={N}: Seed Variability")
+    ax1.xaxis.set_major_locator(MaxNLocator(integer=True))
+    ax1.grid(True, alpha=0.3)
+    ax1.legend()
+    
+    # Right: Standard deviation vs k
+    ax2 = axes[1]
+    ax2.bar(ks_sorted, stds, color="C1", alpha=0.7, edgecolor="C1")
+    ax2.set_xlabel("Number of added monomials (k)")
+    ax2.set_ylabel("Standard deviation across seeds")
+    ax2.set_title("Optimization Variability")
+    ax2.xaxis.set_major_locator(MaxNLocator(integer=True))
+    ax2.grid(True, alpha=0.3, axis="y")
+    
+    plt.tight_layout()
+    
+    if save_path is not None:
+        plt.savefig(save_path)
+    if show:
+        plt.show()
+    
+    return {
+        "run_dir": run_dir,
+        "k": ks_sorted,
+        "stats": stats,
+        "means": means,
+        "stds": stds,
+        "mins": mins,
+        "maxs": maxs,
+        "figure": fig,
+        "axes": axes,
+    }
+
+
+def plot_optimization_timing(
+    *,
+    run_hash: Optional[str] = None,
+    model: Optional[str] = None,
+    N: Optional[int] = None,
+    boundary: str = "periodic",
+    model_params: Optional[Dict[str, float]] = None,
+    start_level: int = 1,
+    end_level: int = 2,
+    method: str = "sa",
+    results_root: Optional[Path] = None,
+    show: bool = True,
+    save_path: Optional[Path] = None,
+) -> Dict[str, Any]:
+    """Plot timing information for optimization runs.
+    
+    Shows how long each optimization takes vs k, useful for planning
+    larger sweeps.
+    
+    Args:
+        Same as plot_optimization_sweep.
+    
+    Returns:
+        Dict with timing data and figure.
+    """
+    results_root = results_root or _default_results_root()
+    
+    meta_query = None
+    if run_hash is None:
+        if model is None or N is None:
+            raise ValueError("Provide either run_hash or (model, N)")
+        meta_query = {
+            "artifact": "spin_optimization_sweep",
+            "model": model,
+            "N": int(N),
+            "boundary": boundary,
+            "start_level": int(start_level),
+            "end_level": int(end_level),
+            "method": method,
+        }
+        if model_params:
+            meta_query["model_params"] = {k: float(v) for k, v in model_params.items()}
+    
+    run_dir = _find_optimization_run_dir(
+        results_root=results_root,
+        run_hash=run_hash,
+        meta_query=meta_query,
+    )
+    
+    meta, data = _load_optimization_data(run_dir)
+    
+    model = meta.get("model", model)
+    N = meta.get("N", N)
+    method = meta.get("method", method)
+    
+    k_arr = data["k"]
+    elapsed_arr = data["elapsed_s"]
+    n_evals_arr = data.get("n_obj_evals", np.ones_like(k_arr))
+    
+    # Average timing per k
+    unique_ks = np.unique(k_arr)
+    avg_time = {int(k): float(np.mean(elapsed_arr[k_arr == k])) for k in unique_ks}
+    avg_evals = {int(k): float(np.mean(n_evals_arr[k_arr == k])) for k in unique_ks}
+    
+    ks_sorted = np.array(sorted(avg_time.keys()))
+    times = np.array([avg_time[k] for k in ks_sorted])
+    evals = np.array([avg_evals[k] for k in ks_sorted])
+    
+    # Time per evaluation
+    time_per_eval = times / evals
+    
+    # --- Plotting ---
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+    
+    # Left: Total time per k
+    ax1 = axes[0]
+    ax1.bar(ks_sorted, times, color="C2", alpha=0.7, edgecolor="C2")
+    ax1.set_xlabel("Number of added monomials (k)")
+    ax1.set_ylabel("Average time per run (seconds)")
+    ax1.set_title(f"{model.capitalize()} N={N}, method={method}: Timing")
+    ax1.xaxis.set_major_locator(MaxNLocator(integer=True))
+    ax1.grid(True, alpha=0.3, axis="y")
+    
+    # Right: Time per objective evaluation
+    ax2 = axes[1]
+    ax2.plot(ks_sorted, time_per_eval * 1000, marker="o", linewidth=2, color="C3")
+    ax2.set_xlabel("Number of added monomials (k)")
+    ax2.set_ylabel("Time per SDP solve (ms)")
+    ax2.set_title("Cost per Objective Evaluation")
+    ax2.xaxis.set_major_locator(MaxNLocator(integer=True))
+    ax2.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    
+    if save_path is not None:
+        plt.savefig(save_path)
+    if show:
+        plt.show()
+    
+    return {
+        "run_dir": run_dir,
+        "k": ks_sorted,
+        "avg_time_s": times,
+        "avg_n_evals": evals,
+        "time_per_eval_s": time_per_eval,
+        "figure": fig,
+        "axes": axes,
+    }
+
+
+def list_optimization_runs(
+    *,
+    results_root: Optional[Path] = None,
+    model: Optional[str] = None,
+    verbose: bool = True,
+) -> List[Dict[str, Any]]:
+    """List available optimization sweep runs.
+    
+    Args:
+        results_root: Override default results directory.
+        model: Filter by model name.
+        verbose: If True, print a formatted table.
+    
+    Returns:
+        List of run info dicts.
+    """
+    results_root = results_root or _default_results_root()
+    
+    runs = []
+    for run_dir in _iter_run_dirs(results_root, "spin_optimization_sweep", 1):
+        try:
+            meta = _load_meta(run_dir)
+        except Exception:
+            continue
+        
+        if model is not None and meta.get("model") != model:
+            continue
+
+        L = meta.get("L", meta.get("adding_set_size"))
+
+        k_values_present = meta.get("k_values_present")
+        k_values_requested = meta.get("k_values_requested")
+
+        # Prefer the actually-present k values; fall back to requested values.
+        k_source = k_values_present or k_values_requested
+        if isinstance(k_source, list) and len(k_source) > 0:
+            try:
+                k_min = int(min(k_source))
+                k_max = int(max(k_source))
+            except Exception:
+                k_min, k_max = None, None
+        else:
+            k_min, k_max = None, None
+        
+        runs.append({
+            "hash": run_dir.name,
+            "model": meta.get("model"),
+            "N": meta.get("N"),
+            "boundary": meta.get("boundary"),
+            "method": meta.get("method"),
+            "start_level": meta.get("start_level"),
+            "end_level": meta.get("end_level"),
+            "L": L,
+            "total_runs": meta.get("total_runs"),
+            "k_values_present": k_values_present,
+            "k_min": k_min,
+            "k_max": k_max,
+            "seeds_present": meta.get("seeds_present"),
+            "updated_at": meta.get("updated_at"),
+            "run_dir": run_dir,
+        })
+    
+    if verbose and runs:
+        print(f"{'Hash':<18} {'Model':<12} {'N':>3} {'Method':>6} {'L':>4} {'k':>9} {'Runs':>5} {'Updated':<20}")
+        print("-" * 80)
+        for r in runs:
+            updated = r.get("updated_at", "")[:19] if r.get("updated_at") else ""
+            k_range = ""
+            if r.get("k_min") is not None and r.get("k_max") is not None:
+                k_range = f"{r['k_min']}..{r['k_max']}"
+            print(f"{r['hash']:<18} {r['model'] or '':<12} {r['N'] or '':>3} "
+                  f"{r['method'] or '':>6} {r['L'] or '':>4} {k_range:>9} {r['total_runs'] or '':>5} {updated:<20}")
+    elif verbose:
+        print("No optimization sweep runs found.")
+    
+    return runs

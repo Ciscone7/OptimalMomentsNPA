@@ -1,4 +1,5 @@
 import re
+from functools import lru_cache
 from typing import List, Tuple, Dict, Set, Optional, Union
 
 # Type aliases
@@ -41,7 +42,7 @@ def npa_level(N: int = 1, NPA_level: int = 1, collapse_rule: bool = False) -> Li
             for seq in prev_seqs:
                 last = seq[-1] if seq else None
                 for tok in tokens:
-                    # avoid consecutive identical tokens: this enforces the "collapse"
+                    # avoid consecutive identical tokens: this enforces the "collapse" (Xi Xi = I rule)
                     if tok != last:
                         curr_seqs.append(seq + (tok,))
             sequences_by_length[length] = curr_seqs
@@ -67,7 +68,7 @@ def npa_level(N: int = 1, NPA_level: int = 1, collapse_rule: bool = False) -> Li
             return unique_labels
 
 
-def pauli_normal_form(expr: str) -> PauliTerm:
+def pauli_normal_form(expr: str) -> PauliTerm: # TODO: check the case of i>=10 for multi-digit
     """
     Take a Pauli string expression built from atomic symbols:
       - 'I'
@@ -138,7 +139,6 @@ def pauli_normal_form(expr: str) -> PauliTerm:
 
     out = "".join(op + str(idx) for idx, op in sorted(cleaned.items()))
     return phase, out
-
 
 def dagger(item: PauliTerm) -> PauliTerm:
     """Return the conjugate transpose of a Pauli term (coeff, word)."""

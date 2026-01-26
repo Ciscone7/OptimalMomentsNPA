@@ -1,4 +1,4 @@
-"""Run Monte Carlo optimization sweeps for moment selection and save results.
+"""Run optimization sweeps for moment selection and save results.
 
 This script finds optimal subsets of monomials to add to a starting basis,
 using simulated annealing, parallel tempering, Bayesian optimization

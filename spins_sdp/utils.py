@@ -9,6 +9,7 @@ import json
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 
 from spins_sdp.bell_algebra import generate_npa_basis
 from spins_sdp.pauli import Operator, PauliWord
@@ -399,11 +400,7 @@ def list_exact_runs(*, limit: int = 20, as_df: bool = False):
     """List stored exact ground energy runs."""
     runs = iter_result_runs(artifact="spin_exact_ground_energy")
     if as_df:
-        try:
-            import pandas as pd
-            return pd.DataFrame(runs[:limit])
-        except ImportError:
-            pass
+        return pd.DataFrame(runs[:limit])
     print(format_result_runs_table(runs, limit=limit))
 
 
@@ -411,11 +408,7 @@ def list_lb_runs(*, limit: int = 20, as_df: bool = False):
     """List stored lower-bound (SDP) runs."""
     runs = iter_result_runs(artifact="spin_moment_energy_lb")
     if as_df:
-        try:
-            import pandas as pd
-            return pd.DataFrame(runs[:limit])
-        except ImportError:
-            pass
+        return pd.DataFrame(runs[:limit])
     print(format_result_runs_table(runs, limit=limit))
 
 

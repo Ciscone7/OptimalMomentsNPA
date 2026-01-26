@@ -18,7 +18,7 @@ On-disk layout (default):
   - seed (int)                # random seed for this run
   - best_value (float)        # best SDP lower bound found
   - elapsed_s (float)         # wall-clock time (seconds)
-  - n_obj_evals (int)         # number of objective evaluations (= steps for SA)
+    - n_obj_evals (int)         # number of objective evaluations (proxy for cost)
   - mask_bits (uint8)         # bit-packed selection mask, shape (n_runs, ceil(L/8))
 
 Examples:
@@ -50,6 +50,9 @@ from spins_sdp.scripts._artifact_io import (
     upsert_meta_json,
     utc_now_iso,
 )
+
+from src.optimalsdp.montecarlo import simulated_annealing, parallel_tempering
+from src.optimalsdp.bayesian import bayesian as bayesian_optimization
 
 
 SCHEMA_VERSION = 1
@@ -273,15 +276,12 @@ def run_single_optimization(
         L: Length of mask (= len(adding_set)).
         k: Number of monomials to select (Hamming weight).
         seed: Random seed.
-        method: "sa" or "pt".
+        method: "sa", "pt", or "bo".
         method_params: Method-specific parameters.
     
     Returns:
         Dict with keys: best_value, mask, elapsed_s, n_obj_evals
     """
-    # Import from optimalsdp.montecarlo (not the package __init__)
-    # This avoids pulling optional dependencies like scikit-learn or jax
-    from src.optimalsdp.montecarlo import simulated_annealing, parallel_tempering
     
     t0 = time.perf_counter()
     
@@ -318,17 +318,47 @@ def run_single_optimization(
         n_epochs = method_params.get("num_epochs", 10)
         steps_per = method_params.get("steps_per_epoch", 50)
         n_obj_evals = n_chains * n_epochs * steps_per + n_chains
+
+    elif method == "bo":
+        # Bayesian optimization
+
+        n_init = int(method_params.get("n_init", 20))
+        n_iter = int(method_params.get("n_iter", 50))
+        candidates_per_iter = int(method_params.get("candidates_per_iter", 100))
+        beta = float(method_params.get("beta", 1.0))
+
+        bo_result = bayesian_optimization(
+            obj_func=obj_func,
+            N=L,
+            k=k,
+            beta=beta,
+            n_init=n_init,
+            n_iter=n_iter,
+            candidates_per_iter=candidates_per_iter,
+            previous_best=None,
+            seed=seed,
+            verbose=False,
+        )
+
+        # BO evaluates the objective once per initial sample and once per iteration
+        n_obj_evals = n_init + n_iter
     else:
         raise ValueError(f"Unknown method: {method}")
     
     elapsed = time.perf_counter() - t0
 
-    best_loss = float(result["best"]["value"])
+    if method in {"sa", "pt"}:
+        best_loss = float(result["best"]["value"])
+        best_mask = np.asarray(result["best"]["selection"], dtype=np.int32)
+    else:
+        best_loss = float(bo_result["best_value"])
+        best_mask = np.asarray(bo_result["best_selection"], dtype=np.int32)
+
     best_lb = -best_loss
 
     return {
         "best_value": float(best_lb),
-        "mask": np.asarray(result["best"]["selection"], dtype=np.int32),
+        "mask": best_mask,
         "elapsed_s": elapsed,
         "n_obj_evals": n_obj_evals,
     }
@@ -669,7 +699,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--end-level", type=int, default=2, help="NPA level for final set")
     
     # Optimization method
-    p.add_argument("--method", choices=["sa", "pt"], default="sa", help="sa=simulated annealing, pt=parallel tempering")
+    p.add_argument(
+        "--method",
+        choices=["sa", "pt", "bo"],
+        default="sa",
+        help="sa=simulated annealing, pt=parallel tempering, bo=bayesian optimization",
+    )
     
     # SA parameters
     p.add_argument("--sa-steps", type=int, default=100, help="SA: number of steps")
@@ -682,6 +717,17 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--pt-steps-per-epoch", type=int, default=50, help="PT: steps per epoch")
     p.add_argument("--pt-T-min", type=float, default=0.01, help="PT: minimum temperature")
     p.add_argument("--pt-T-max", type=float, default=2.0, help="PT: maximum temperature")
+
+    # BO parameters
+    p.add_argument("--bo-beta", type=float, default=1.0, help="BO: UCB exploration parameter (beta)")
+    p.add_argument("--bo-n-init", type=int, default=20, help="BO: number of initial random samples")
+    p.add_argument("--bo-n-iter", type=int, default=50, help="BO: number of BO iterations")
+    p.add_argument(
+        "--bo-candidates-per-iter",
+        type=int,
+        default=100,
+        help="BO: number of candidate masks scored by the surrogate per iteration",
+    )
     
     # Sweep parameters
     k_group = p.add_mutually_exclusive_group(required=True)
@@ -730,13 +776,20 @@ def main(argv: Optional[List[str]] = None) -> int:
             "T_start": args.sa_T_start,
             "alpha": args.sa_alpha,
         }
-    else:
+    elif args.method == "pt":
         method_params = {
             "num_chains": args.pt_chains,
             "num_epochs": args.pt_epochs,
             "steps_per_epoch": args.pt_steps_per_epoch,
             "T_min": args.pt_T_min,
             "T_max": args.pt_T_max,
+        }
+    else:
+        method_params = {
+            "beta": args.bo_beta,
+            "n_init": args.bo_n_init,
+            "n_iter": args.bo_n_iter,
+            "candidates_per_iter": args.bo_candidates_per_iter,
         }
     
     model_params = _model_params_from_args(args)

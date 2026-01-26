@@ -35,9 +35,9 @@ from datetime import datetime
 try:
     import h5py
 except ImportError:
-    print("Error: h5py not installed. Install with: pip install h5py")
-    import sys
-    sys.exit(1)
+    raise ImportError(
+        "h5py not installed. Install with: pip install h5py"
+    )
 
 
 def load_config(config_path):

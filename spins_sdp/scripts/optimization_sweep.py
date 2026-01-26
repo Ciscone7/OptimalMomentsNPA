@@ -1,7 +1,11 @@
 """Run Monte Carlo optimization sweeps for moment selection and save results.
 
 This script finds optimal subsets of monomials to add to a starting basis,
-using simulated annealing or parallel tempering to minimize the SDP relaxation energy.
+using simulated annealing, parallel tempering, Bayesian optimization, or random
+sampling to minimize the SDP relaxation energy.
+
+The random sampling method (`--method random`) provides a baseline for comparison:
+it randomly selects k monomials without any optimization.
 
 Results are saved in a resumable way:
   - Results are grouped by a hash of the full configuration.
@@ -51,8 +55,6 @@ from spins_sdp.scripts._artifact_io import (
     utc_now_iso,
 )
 
-from src.optimalsdp.montecarlo import simulated_annealing, parallel_tempering
-from src.optimalsdp.bayesian import bayesian as bayesian_optimization
 
 
 SCHEMA_VERSION = 1
@@ -276,7 +278,7 @@ def run_single_optimization(
         L: Length of mask (= len(adding_set)).
         k: Number of monomials to select (Hamming weight).
         seed: Random seed.
-        method: "sa", "pt", or "bo".
+        method: "sa", "pt", "bo", or "random".
         method_params: Method-specific parameters.
     
     Returns:
@@ -286,6 +288,8 @@ def run_single_optimization(
     t0 = time.perf_counter()
     
     if method == "sa":
+        from src.optimalsdp.montecarlo import simulated_annealing
+
         result = simulated_annealing(
             obj_func=obj_func,
             N=L,
@@ -301,6 +305,8 @@ def run_single_optimization(
         n_obj_evals = method_params.get("steps", 100) + 1  # +1 for initial eval
         
     elif method == "pt":
+        from src.optimalsdp.montecarlo import parallel_tempering
+
         result = parallel_tempering(
             obj_func=obj_func,
             N=L,
@@ -322,6 +328,13 @@ def run_single_optimization(
     elif method == "bo":
         # Bayesian optimization
 
+        try:
+            from src.optimalsdp.bayesian import bayesian as bayesian_optimization
+        except ModuleNotFoundError as e:
+            raise ModuleNotFoundError(
+                "Bayesian optimization requires scikit-learn. Install it with: pip install scikit-learn"
+            ) from e
+
         n_init = int(method_params.get("n_init", 20))
         n_iter = int(method_params.get("n_iter", 50))
         candidates_per_iter = int(method_params.get("candidates_per_iter", 100))
@@ -342,6 +355,35 @@ def run_single_optimization(
 
         # BO evaluates the objective once per initial sample and once per iteration
         n_obj_evals = n_init + n_iter
+
+    elif method == "random":
+        # Random sampling baseline: just pick k random positions and evaluate once.
+        # No optimization - this is a baseline for comparison.
+        import random as py_random
+
+        if seed is not None:
+            np.random.seed(seed)
+            py_random.seed(seed)
+
+        # Generate random mask with exactly k ones
+        mask = np.zeros(L, dtype=np.int32)
+        if 0 < k <= L:
+            chosen_indices = py_random.sample(range(L), k)
+            mask[chosen_indices] = 1
+
+        # Evaluate objective (returns negative of lower bound)
+        loss = obj_func(mask)
+        best_lb = -float(loss)
+
+        elapsed = time.perf_counter() - t0
+
+        return {
+            "best_value": best_lb,
+            "mask": mask,
+            "elapsed_s": elapsed,
+            "n_obj_evals": 1,  # Single evaluation for random sampling
+        }
+
     else:
         raise ValueError(f"Unknown method: {method}")
     
@@ -350,9 +392,10 @@ def run_single_optimization(
     if method in {"sa", "pt"}:
         best_loss = float(result["best"]["value"])
         best_mask = np.asarray(result["best"]["selection"], dtype=np.int32)
-    else:
+    elif method == "bo":
         best_loss = float(bo_result["best_value"])
         best_mask = np.asarray(bo_result["best_selection"], dtype=np.int32)
+    # Note: "random" returns early above, so we don't handle it here
 
     best_lb = -best_loss
 
@@ -701,9 +744,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     # Optimization method
     p.add_argument(
         "--method",
-        choices=["sa", "pt", "bo"],
+        choices=["sa", "pt", "bo", "random"],
         default="sa",
-        help="sa=simulated annealing, pt=parallel tempering, bo=bayesian optimization",
+        help="sa=simulated annealing, pt=parallel tempering, bo=bayesian optimization, random=random sampling baseline",
     )
     
     # SA parameters
@@ -784,13 +827,16 @@ def main(argv: Optional[List[str]] = None) -> int:
             "T_min": args.pt_T_min,
             "T_max": args.pt_T_max,
         }
-    else:
+    elif args.method == "bo":
         method_params = {
             "beta": args.bo_beta,
             "n_init": args.bo_n_init,
             "n_iter": args.bo_n_iter,
             "candidates_per_iter": args.bo_candidates_per_iter,
         }
+    else:
+        # random method has no hyperparameters
+        method_params = {}
     
     model_params = _model_params_from_args(args)
     

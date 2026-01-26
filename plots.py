@@ -1593,6 +1593,7 @@ def list_optimization_runs(
     *,
     results_root: Optional[Path] = None,
     model: Optional[str] = None,
+    method: Optional[str] = None,
     verbose: bool = True,
 ) -> List[Dict[str, Any]]:
     """List available optimization sweep runs.
@@ -1600,6 +1601,7 @@ def list_optimization_runs(
     Args:
         results_root: Override default results directory.
         model: Filter by model name.
+        method: Filter by method name (e.g., "sa", "random").
         verbose: If True, print a formatted table.
     
     Returns:
@@ -1615,6 +1617,9 @@ def list_optimization_runs(
             continue
         
         if model is not None and meta.get("model") != model:
+            continue
+        
+        if method is not None and meta.get("method") != method:
             continue
 
         L = meta.get("L", meta.get("adding_set_size"))
@@ -1665,3 +1670,558 @@ def list_optimization_runs(
         print("No optimization sweep runs found.")
     
     return runs
+
+
+# =============================================================================
+# Optimization vs Random Comparison Plotting Functions
+# =============================================================================
+
+def _compute_per_k_statistics(
+    k_arr: np.ndarray,
+    value_arr: np.ndarray,
+    seed_arr: np.ndarray,
+) -> Dict[str, Any]:
+    """Compute statistics per k value.
+    
+    Returns dict with:
+        - unique_ks: sorted array of unique k values
+        - mean, std, min, max: arrays of statistics per k
+        - all_values: dict mapping k -> array of all values for that k
+    """
+    unique_ks = np.unique(k_arr)
+    unique_ks = np.sort(unique_ks)
+    
+    means = []
+    stds = []
+    mins = []
+    maxs = []
+    all_values = {}
+    
+    for k in unique_ks:
+        mask = k_arr == k
+        values = value_arr[mask]
+        all_values[int(k)] = values
+        means.append(np.mean(values))
+        stds.append(np.std(values))
+        mins.append(np.min(values))
+        maxs.append(np.max(values))
+    
+    return {
+        "unique_ks": unique_ks,
+        "mean": np.array(means),
+        "std": np.array(stds),
+        "min": np.array(mins),
+        "max": np.array(maxs),
+        "all_values": all_values,
+    }
+
+
+def find_matching_runs(
+    *,
+    results_root: Optional[Path] = None,
+    model: str,
+    N: int,
+    boundary: str = "periodic",
+    model_params: Optional[Dict[str, float]] = None,
+    start_level: int = 1,
+    end_level: int = 2,
+    optimization_method: str = "sa",
+) -> Tuple[Optional[Path], Optional[Path]]:
+    """Find matching optimization and random sampling runs.
+    
+    Finds runs with matching model/N/boundary/levels where one uses the specified
+    optimization method and the other uses random sampling.
+    
+    Args:
+        results_root: Override default results directory.
+        model: Model name.
+        N: Number of sites.
+        boundary: "periodic" or "open".
+        model_params: Model-specific parameters.
+        start_level: NPA level for starting set.
+        end_level: NPA level for final set.
+        optimization_method: Optimization method (e.g., "sa", "pt", "bo").
+    
+    Returns:
+        (optimization_run_dir, random_run_dir) - either can be None if not found.
+    """
+    results_root = results_root or _default_results_root()
+    
+    base_query = {
+        "artifact": "spin_optimization_sweep",
+        "schema_version": 1,
+        "model": model,
+        "N": int(N),
+        "boundary": boundary,
+        "start_level": int(start_level),
+        "end_level": int(end_level),
+    }
+    if model_params:
+        base_query["model_params"] = {k: float(v) for k, v in model_params.items()}
+    
+    opt_run = None
+    random_run = None
+    
+    # Find optimization run
+    opt_query = {**base_query, "method": optimization_method}
+    try:
+        opt_run = _find_run_dir(
+            results_root=results_root,
+            artifact="spin_optimization_sweep",
+            schema_version=1,
+            meta_query=opt_query,
+        )
+    except FileNotFoundError:
+        pass
+    
+    # Find random run
+    random_query = {**base_query, "method": "random"}
+    try:
+        random_run = _find_run_dir(
+            results_root=results_root,
+            artifact="spin_optimization_sweep",
+            schema_version=1,
+            meta_query=random_query,
+        )
+    except FileNotFoundError:
+        pass
+    
+    return opt_run, random_run
+
+
+def plot_optimization_vs_random(
+    *,
+    opt_run_hash: Optional[str] = None,
+    random_run_hash: Optional[str] = None,
+    model: Optional[str] = None,
+    N: Optional[int] = None,
+    boundary: str = "periodic",
+    model_params: Optional[Dict[str, float]] = None,
+    start_level: int = 1,
+    end_level: int = 2,
+    optimization_method: str = "sa",
+    exact_energy: Optional[float] = None,
+    results_root: Optional[Path] = None,
+    per_site: bool = False,
+    show: bool = True,
+    save_path: Optional[Path] = None,
+) -> Dict[str, Any]:
+    """Compare optimization results vs random sampling baseline.
+    
+    Creates a comprehensive comparison plot with:
+    - Left panel: Mean ± std with min-max envelope for both methods
+    - Right panel: Mean improvement (optimization - random) with std
+    
+    Two call styles:
+      1) Hash-based: provide `opt_run_hash` and `random_run_hash`
+      2) Param-based: provide model, N, etc. to find matching runs
+    
+    Args:
+        opt_run_hash: Explicit hash of optimization run directory.
+        random_run_hash: Explicit hash of random sampling run directory.
+        model: Model name for parameter-based lookup.
+        N: Number of sites for parameter-based lookup.
+        boundary: "periodic" or "open".
+        model_params: Model-specific parameters.
+        start_level: NPA level for starting set.
+        end_level: NPA level for final set.
+        optimization_method: Which optimization method to compare (default "sa").
+        exact_energy: Exact ground state energy (optional).
+        results_root: Override default results directory.
+        per_site: If True, plot energy per site.
+        show: Whether to call plt.show().
+        save_path: If provided, save figure to this path.
+    
+    Returns:
+        Dict with run info, statistics, and figure/axes.
+    """
+    results_root = results_root or _default_results_root()
+    
+    # Find or load runs
+    if opt_run_hash is not None:
+        opt_run = results_root / "spin_optimization_sweep" / "v1" / opt_run_hash
+    elif model is not None and N is not None:
+        opt_run, _ = find_matching_runs(
+            results_root=results_root,
+            model=model,
+            N=N,
+            boundary=boundary,
+            model_params=model_params,
+            start_level=start_level,
+            end_level=end_level,
+            optimization_method=optimization_method,
+        )
+    else:
+        raise ValueError("Provide either opt_run_hash or (model, N)")
+    
+    if random_run_hash is not None:
+        random_run = results_root / "spin_optimization_sweep" / "v1" / random_run_hash
+    elif model is not None and N is not None:
+        _, random_run = find_matching_runs(
+            results_root=results_root,
+            model=model,
+            N=N,
+            boundary=boundary,
+            model_params=model_params,
+            start_level=start_level,
+            end_level=end_level,
+            optimization_method=optimization_method,
+        )
+    else:
+        random_run = None
+    
+    if opt_run is None:
+        raise FileNotFoundError(
+            f"No optimization run found for {model} N={N} method={optimization_method}"
+        )
+    if random_run is None:
+        raise FileNotFoundError(
+            f"No random sampling run found for {model} N={N}. "
+            f"Run with --method random first."
+        )
+    
+    # Load data
+    opt_meta, opt_data = _load_optimization_data(opt_run)
+    random_meta, random_data = _load_optimization_data(random_run)
+    
+    # Extract model info
+    model = opt_meta.get("model", model)
+    N = opt_meta.get("N", N)
+    boundary = opt_meta.get("boundary", boundary)
+    model_params = opt_meta.get("model_params", model_params or {})
+    
+    # Compute statistics for both
+    opt_stats = _compute_per_k_statistics(
+        opt_data["k"], opt_data["best_value"], opt_data.get("seed", np.zeros_like(opt_data["k"]))
+    )
+    random_stats = _compute_per_k_statistics(
+        random_data["k"], random_data["best_value"], random_data.get("seed", np.zeros_like(random_data["k"]))
+    )
+    
+    # Find common k values
+    common_ks = np.intersect1d(opt_stats["unique_ks"], random_stats["unique_ks"])
+    
+    if len(common_ks) == 0:
+        raise ValueError("No overlapping k values between optimization and random runs")
+    
+    # Build aligned arrays for common k values
+    opt_idx = {int(k): i for i, k in enumerate(opt_stats["unique_ks"])}
+    random_idx = {int(k): i for i, k in enumerate(random_stats["unique_ks"])}
+    
+    opt_mean = np.array([opt_stats["mean"][opt_idx[int(k)]] for k in common_ks])
+    opt_std = np.array([opt_stats["std"][opt_idx[int(k)]] for k in common_ks])
+    opt_min = np.array([opt_stats["min"][opt_idx[int(k)]] for k in common_ks])
+    opt_max = np.array([opt_stats["max"][opt_idx[int(k)]] for k in common_ks])
+    
+    random_mean = np.array([random_stats["mean"][random_idx[int(k)]] for k in common_ks])
+    random_std = np.array([random_stats["std"][random_idx[int(k)]] for k in common_ks])
+    random_min = np.array([random_stats["min"][random_idx[int(k)]] for k in common_ks])
+    random_max = np.array([random_stats["max"][random_idx[int(k)]] for k in common_ks])
+    
+    # Compute improvement (optimization - random)
+    # Higher is better for lower bounds, so improvement = opt - random
+    improvement_mean = opt_mean - random_mean
+    # Propagate uncertainty: std of difference
+    improvement_std = np.sqrt(opt_std**2 + random_std**2)
+    
+    # Get exact energy if not provided
+    E0_source = "provided"
+    if exact_energy is None:
+        exact_energy, E0_source = _get_exact_energy_from_artifact_or_compute(
+            model=model,
+            N=N,
+            boundary=boundary,
+            model_params=model_params,
+            results_root=results_root,
+        )
+    
+    # Scale by N if per_site
+    scale = N if per_site else 1
+    E0_plot = exact_energy / scale
+    opt_mean_plot = opt_mean / scale
+    opt_std_plot = opt_std / scale
+    opt_min_plot = opt_min / scale
+    opt_max_plot = opt_max / scale
+    random_mean_plot = random_mean / scale
+    random_std_plot = random_std / scale
+    random_min_plot = random_min / scale
+    random_max_plot = random_max / scale
+    improvement_mean_plot = improvement_mean / scale
+    improvement_std_plot = improvement_std / scale
+    
+    ylabel = "Energy per site (E/N)" if per_site else "Energy"
+    
+    # --- Plotting ---
+    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+    
+    # Left panel: Comparison of both methods
+    ax1 = axes[0]
+    
+    # Random sampling (red)
+    ax1.fill_between(common_ks, random_min_plot, random_max_plot, 
+                     alpha=0.15, color="C3", label="Random: Min-Max")
+    ax1.fill_between(common_ks, random_mean_plot - random_std_plot, 
+                     random_mean_plot + random_std_plot,
+                     alpha=0.3, color="C3", label="Random: Mean ± std")
+    ax1.plot(common_ks, random_mean_plot, marker="s", linewidth=2, 
+             color="C3", label="Random: Mean", markersize=5)
+    
+    # Optimization (blue)
+    ax1.fill_between(common_ks, opt_min_plot, opt_max_plot,
+                     alpha=0.15, color="C0", label=f"{optimization_method.upper()}: Min-Max")
+    ax1.fill_between(common_ks, opt_mean_plot - opt_std_plot,
+                     opt_mean_plot + opt_std_plot,
+                     alpha=0.3, color="C0", label=f"{optimization_method.upper()}: Mean ± std")
+    ax1.plot(common_ks, opt_mean_plot, marker="o", linewidth=2,
+             color="C0", label=f"{optimization_method.upper()}: Mean", markersize=5)
+    
+    # Exact energy
+    ax1.axhline(E0_plot, color="green", linestyle="--", linewidth=2,
+                label=f"Exact $E_0$ ({E0_source})")
+    
+    ax1.set_xlabel("Number of added monomials (k)")
+    ax1.set_ylabel(ylabel)
+    ax1.set_title(f"{model.capitalize()} N={N}: Optimization vs Random")
+    ax1.xaxis.set_major_locator(MaxNLocator(integer=True))
+    ax1.grid(True, alpha=0.3)
+    ax1.legend(loc="lower right", fontsize=8)
+    
+    # Middle panel: Mean improvement
+    ax2 = axes[1]
+    
+    ax2.fill_between(common_ks, 
+                     improvement_mean_plot - improvement_std_plot,
+                     improvement_mean_plot + improvement_std_plot,
+                     alpha=0.3, color="C2")
+    ax2.plot(common_ks, improvement_mean_plot, marker="o", linewidth=2,
+             color="C2", markersize=5)
+    ax2.axhline(0, color="gray", linestyle=":", linewidth=1)
+    
+    ax2.set_xlabel("Number of added monomials (k)")
+    ylabel_imp = "Improvement per site" if per_site else "Improvement"
+    ax2.set_ylabel(f"{ylabel_imp} ({optimization_method.upper()} - Random)")
+    ax2.set_title("Mean Improvement ± Combined Std")
+    ax2.xaxis.set_major_locator(MaxNLocator(integer=True))
+    ax2.grid(True, alpha=0.3)
+    
+    # Right panel: Relative improvement (% of gap closed)
+    ax3 = axes[2]
+    
+    # Relative improvement: how much of the gap to exact did optimization close vs random?
+    # Gap for random: E0 - random_mean
+    # Gap for optimization: E0 - opt_mean
+    # Relative improvement = (random_gap - opt_gap) / random_gap * 100
+    #                      = (opt_mean - random_mean) / (E0 - random_mean) * 100
+    random_gap = exact_energy - random_mean
+    opt_gap = exact_energy - opt_mean
+    
+    # Avoid division by zero
+    with np.errstate(divide='ignore', invalid='ignore'):
+        relative_improvement = np.where(
+            np.abs(random_gap) > 1e-12,
+            (opt_mean - random_mean) / np.abs(random_gap) * 100,
+            0.0
+        )
+    
+    ax3.bar(common_ks, relative_improvement, color="C4", alpha=0.7, edgecolor="C4")
+    ax3.axhline(0, color="gray", linestyle=":", linewidth=1)
+    ax3.set_xlabel("Number of added monomials (k)")
+    ax3.set_ylabel("Relative Improvement (%)")
+    ax3.set_title("% of Random's Gap Closed by Optimization")
+    ax3.xaxis.set_major_locator(MaxNLocator(integer=True))
+    ax3.grid(True, alpha=0.3, axis="y")
+    
+    plt.tight_layout()
+    
+    if save_path is not None:
+        plt.savefig(save_path)
+    if show:
+        plt.show()
+    
+    return {
+        "opt_run_dir": opt_run,
+        "random_run_dir": random_run,
+        "opt_meta": opt_meta,
+        "random_meta": random_meta,
+        "common_ks": common_ks,
+        "opt_stats": {
+            "mean": opt_mean,
+            "std": opt_std,
+            "min": opt_min,
+            "max": opt_max,
+        },
+        "random_stats": {
+            "mean": random_mean,
+            "std": random_std,
+            "min": random_min,
+            "max": random_max,
+        },
+        "improvement": {
+            "mean": improvement_mean,
+            "std": improvement_std,
+            "relative_percent": relative_improvement,
+        },
+        "exact_energy": exact_energy,
+        "exact_energy_source": E0_source,
+        "figure": fig,
+        "axes": axes,
+    }
+
+
+def plot_method_comparison(
+    *,
+    model: str,
+    N: int,
+    boundary: str = "periodic",
+    model_params: Optional[Dict[str, float]] = None,
+    start_level: int = 1,
+    end_level: int = 2,
+    methods: Optional[List[str]] = None,
+    exact_energy: Optional[float] = None,
+    results_root: Optional[Path] = None,
+    per_site: bool = False,
+    show: bool = True,
+    save_path: Optional[Path] = None,
+) -> Dict[str, Any]:
+    """Compare multiple optimization methods on the same problem.
+    
+    Plots mean ± std for each method found (sa, pt, bo, random, etc.).
+    
+    Args:
+        model: Model name.
+        N: Number of sites.
+        boundary: "periodic" or "open".
+        model_params: Model-specific parameters.
+        start_level: NPA level for starting set.
+        end_level: NPA level for final set.
+        methods: List of methods to compare. If None, finds all available.
+        exact_energy: Exact ground state energy (optional).
+        results_root: Override default results directory.
+        per_site: If True, plot energy per site.
+        show: Whether to call plt.show().
+        save_path: If provided, save figure to this path.
+    
+    Returns:
+        Dict with method statistics and figure/axes.
+    """
+    results_root = results_root or _default_results_root()
+    
+    # Find all available methods if not specified
+    if methods is None:
+        methods = ["sa", "pt", "bo", "random"]
+    
+    method_data = {}
+    
+    for method in methods:
+        query = {
+            "artifact": "spin_optimization_sweep",
+            "model": model,
+            "N": int(N),
+            "boundary": boundary,
+            "start_level": int(start_level),
+            "end_level": int(end_level),
+            "method": method,
+        }
+        if model_params:
+            query["model_params"] = {k: float(v) for k, v in model_params.items()}
+        
+        try:
+            run_dir = _find_run_dir(
+                results_root=results_root,
+                artifact="spin_optimization_sweep",
+                schema_version=1,
+                meta_query=query,
+            )
+            meta, data = _load_optimization_data(run_dir)
+            stats = _compute_per_k_statistics(
+                data["k"], data["best_value"], 
+                data.get("seed", np.zeros_like(data["k"]))
+            )
+            method_data[method] = {
+                "run_dir": run_dir,
+                "meta": meta,
+                "stats": stats,
+            }
+        except FileNotFoundError:
+            continue
+    
+    if not method_data:
+        raise FileNotFoundError(
+            f"No optimization runs found for {model} N={N}"
+        )
+    
+    # Get exact energy
+    E0_source = "provided"
+    if exact_energy is None:
+        exact_energy, E0_source = _get_exact_energy_from_artifact_or_compute(
+            model=model,
+            N=N,
+            boundary=boundary,
+            model_params=model_params or {},
+            results_root=results_root,
+        )
+    
+    # Find common k values across all methods
+    all_ks = [set(d["stats"]["unique_ks"]) for d in method_data.values()]
+    common_ks = sorted(set.intersection(*all_ks)) if all_ks else []
+    
+    if not common_ks:
+        # Fall back to union
+        common_ks = sorted(set.union(*all_ks))
+    
+    common_ks = np.array(common_ks)
+    
+    # Scale
+    scale = N if per_site else 1
+    ylabel = "Energy per site (E/N)" if per_site else "Energy"
+    
+    # Color map for methods
+    colors = {
+        "random": "C3",
+        "sa": "C0",
+        "pt": "C1",
+        "bo": "C2",
+    }
+    
+    # --- Plotting ---
+    fig, ax1 = plt.subplots(1, 1, figsize=(8, 5))
+    
+    for method, mdata in method_data.items():
+        stats = mdata["stats"]
+        ks = stats["unique_ks"]
+        mean = stats["mean"] / scale
+        std = stats["std"] / scale
+        
+        color = colors.get(method, "C5")
+        label = method.upper() if method != "random" else "Random"
+        
+        ax1.fill_between(ks, mean - std, mean + std, alpha=0.2, color=color)
+        ax1.plot(ks, mean, marker="o", linewidth=2, color=color, 
+                 label=f"{label}: Mean ± std", markersize=4)
+    
+    ax1.axhline(exact_energy / scale, color="green", linestyle="--", 
+                linewidth=2, label=f"Exact $E_0$ ({E0_source})")
+    
+    ax1.set_xlabel("Number of added monomials (k)")
+    ax1.set_ylabel(ylabel)
+    ax1.set_title(f"{model.capitalize()} N={N}: Method Comparison")
+    ax1.xaxis.set_major_locator(MaxNLocator(integer=True))
+    ax1.grid(True, alpha=0.3)
+    ax1.legend(loc="lower right", fontsize=9)
+    
+    plt.tight_layout()
+    
+    if save_path is not None:
+        plt.savefig(save_path)
+    if show:
+        plt.show()
+    
+    return {
+        "methods": list(method_data.keys()),
+        "method_data": method_data,
+        "common_ks": common_ks,
+        "exact_energy": exact_energy,
+        "exact_energy_source": E0_source,
+        "figure": fig,
+        "axes": [ax1],
+    }

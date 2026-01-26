@@ -27,6 +27,8 @@ Usage:
 import json
 import itertools
 import numpy as np
+import pandas as pd
+import sys
 from pathlib import Path
 from collections import defaultdict
 from typing import List, Dict, Any, Optional, Set
@@ -486,11 +488,6 @@ def results_to_dataframe(config_path, scalars_only=True, include_fixed=False):
         df = results_to_dataframe("config.json", include_fixed=True)
         print(df[['param_temperature', 'fixed_num_particles', 'energy']])
     """
-    try:
-        import pandas as pd
-    except ImportError:
-        raise ImportError("pandas is required. Install with: pip install pandas")
-    
     results = load_results_from_config(config_path, include_fixed=include_fixed)
     
     if scalars_only:
@@ -532,8 +529,6 @@ def get_completion_summary(config_path):
 
 # Command-line interface
 if __name__ == "__main__":
-    import sys
-    
     if len(sys.argv) < 2:
         print("Usage: python results_manager.py <config_file>")
         print("\nExamples:")
@@ -563,7 +558,6 @@ if __name__ == "__main__":
     
     # Try to load and show some stats
     try:
-        import pandas as pd
         df = results_to_dataframe(config_file, scalars_only=True)
         
         if not df.empty:
@@ -581,6 +575,5 @@ if __name__ == "__main__":
             if result_cols:
                 print(f"\nResult statistics:")
                 print(df[result_cols].describe())
-    except ImportError:
-        print("\nNote: Install pandas to see DataFrame statistics")
-        print("  pip install pandas")
+    except Exception:
+        print("\nNote: Could not compute DataFrame statistics")

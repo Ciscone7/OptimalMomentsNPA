@@ -1,8 +1,7 @@
 """Run Monte Carlo optimization sweeps for moment selection and save results.
 
 This script finds optimal subsets of monomials to add to a starting basis,
-using simulated annealing, parallel tempering, Bayesian optimization, or random
-sampling to minimize the SDP relaxation energy.
+using simulated annealing, parallel tempering, Bayesian optimization
 
 The random sampling method (`--method random`) provides a baseline for comparison:
 it randomly selects k monomials without any optimization.
@@ -34,16 +33,17 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 import platform
+import random
 import sys
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Mapping, Optional, Set, Tuple
 
 import numpy as np
-
-if TYPE_CHECKING:
-    import pandas as pd
+import pandas as pd
+from tqdm import tqdm
 
 from spins_sdp import models
 from spins_sdp.basis_builder import generate_npa_basis
@@ -54,6 +54,9 @@ from spins_sdp.scripts._artifact_io import (
     upsert_meta_json,
     utc_now_iso,
 )
+
+from src.optimalsdp.montecarlo import parallel_tempering, simulated_annealing
+from src.optimalsdp.bayesian import bayesian as bayesian_optimization
 
 
 
@@ -288,8 +291,6 @@ def run_single_optimization(
     t0 = time.perf_counter()
     
     if method == "sa":
-        from src.optimalsdp.montecarlo import simulated_annealing
-
         result = simulated_annealing(
             obj_func=obj_func,
             N=L,
@@ -305,8 +306,6 @@ def run_single_optimization(
         n_obj_evals = method_params.get("steps", 100) + 1  # +1 for initial eval
         
     elif method == "pt":
-        from src.optimalsdp.montecarlo import parallel_tempering
-
         result = parallel_tempering(
             obj_func=obj_func,
             N=L,
@@ -327,13 +326,6 @@ def run_single_optimization(
 
     elif method == "bo":
         # Bayesian optimization
-
-        try:
-            from src.optimalsdp.bayesian import bayesian as bayesian_optimization
-        except ModuleNotFoundError as e:
-            raise ModuleNotFoundError(
-                "Bayesian optimization requires scikit-learn. Install it with: pip install scikit-learn"
-            ) from e
 
         n_init = int(method_params.get("n_init", 20))
         n_iter = int(method_params.get("n_iter", 50))
@@ -359,16 +351,14 @@ def run_single_optimization(
     elif method == "random":
         # Random sampling baseline: just pick k random positions and evaluate once.
         # No optimization - this is a baseline for comparison.
-        import random as py_random
-
         if seed is not None:
             np.random.seed(seed)
-            py_random.seed(seed)
+            random.seed(seed)
 
         # Generate random mask with exactly k ones
         mask = np.zeros(L, dtype=np.int32)
         if 0 < k <= L:
-            chosen_indices = py_random.sample(range(L), k)
+            chosen_indices = random.sample(range(L), k)
             mask[chosen_indices] = 1
 
         # Evaluate objective (returns negative of lower bound)
@@ -540,8 +530,6 @@ def compute_and_save(
         next_run_idx = 0
     
     # Run missing jobs
-    from tqdm import tqdm
-    
     pbar = tqdm(missing_jobs, desc="Optimization sweep", disable=not verbose)
     for kv, s in pbar:
         pbar.set_postfix({"k": kv, "seed": s})
@@ -640,8 +628,6 @@ def load_optimization_results(
             - meta: metadata dict
             - data: dict of arrays (run_idx, k, seed, best_value, elapsed_s, n_obj_evals, masks)
     """
-    import json
-    
     meta_path = run_dir / "meta.json"
     data_path = run_dir / "data.npz"
     
@@ -668,8 +654,6 @@ def results_to_dataframe(run_dir: Path) -> pd.DataFrame:
         DataFrame with columns: run_idx, k, seed, best_value, elapsed_s, n_obj_evals
         (masks not included for simplicity)
     """
-    import pandas as pd
-    
     results = load_optimization_results(run_dir, unpack_masks=False)
     data = results["data"]
     

@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Mapping, MutableMapping, Tuple
 
@@ -10,9 +11,6 @@ import numpy as np
 
 
 def utc_now_iso() -> str:
-    # Local import keeps this file lightweight for tooling.
-    from datetime import datetime, timezone
-
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 

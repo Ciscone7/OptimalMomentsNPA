@@ -10,7 +10,10 @@ class PauliNPABasis:
     Canonical unique basis up to level k (shortest-length representatives).
 
     words:      all unique words reachable by <= k generator multiplications
-    levels:     levels[ℓ] are the words whose minimal length is exactly ℓ
+                (i.e., the full NPA level k basis = union of levels[0:k+1])
+    levels:     levels[ℓ] contains words whose minimal length is exactly ℓ
+                (minimal = fewest generator multiplications to reach from identity)
+                To recover NPA level m<k basis: concatenate levels[0] through levels[m]
     min_len:    minimal length at which each word appears
     index:      word -> index in `words` (deterministic ordering)
     """

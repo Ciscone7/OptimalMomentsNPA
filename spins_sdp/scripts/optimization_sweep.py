@@ -46,7 +46,6 @@ import pandas as pd
 from tqdm import tqdm
 
 from spins_sdp import models
-from spins_sdp.basis_builder import generate_npa_basis
 from spins_sdp.sdp import solve_pauli_relaxation
 from spins_sdp.scripts._artifact_io import (
     config_hash,
@@ -54,6 +53,7 @@ from spins_sdp.scripts._artifact_io import (
     upsert_meta_json,
     utc_now_iso,
 )
+from spins_sdp.scripts._common import build_npa_basis_sets, hamiltonian_dict_fn, model_params_from_args
 
 from src.optimalsdp.montecarlo import parallel_tempering, simulated_annealing
 from src.optimalsdp.bayesian import bayesian as bayesian_optimization
@@ -75,56 +75,6 @@ _SCALAR_FIELDS = {
     "elapsed_s": np.dtype("float64"),
     "n_obj_evals": np.dtype("int32"),
 }
-
-
-# -----------------------------------------------------------------------------
-# Helpers
-# -----------------------------------------------------------------------------
-
-def _stable_list_hash(items: List[str], n_chars: int = 16) -> str:
-    """Hash a list of strings for fingerprinting."""
-    payload = "\n".join(items).encode("utf-8")
-    return hashlib.sha256(payload).hexdigest()[:n_chars]
-
-
-def _pack_masks(masks: List[np.ndarray]) -> np.ndarray:
-    """Bit-pack a list of boolean/int masks into a uint8 array.
-    
-    Args:
-        masks: List of 1D arrays of shape (L,) with 0/1 values.
-    
-    Returns:
-        2D uint8 array of shape (n_masks, ceil(L/8)).
-    """
-    if not masks:
-        return np.array([], dtype=np.uint8).reshape(0, 0)
-    
-    L = len(masks[0])
-    packed = []
-    for m in masks:
-        bits = np.packbits(m.astype(np.uint8))
-        packed.append(bits)
-    return np.stack(packed, axis=0)
-
-
-def _unpack_masks(packed: np.ndarray, L: int) -> np.ndarray:
-    """Unpack bit-packed masks back to boolean array.
-    
-    Args:
-        packed: 2D uint8 array of shape (n_masks, ceil(L/8)).
-        L: Original mask length.
-    
-    Returns:
-        2D bool array of shape (n_masks, L).
-    """
-    if packed.size == 0:
-        return np.array([], dtype=bool).reshape(0, L)
-    
-    unpacked = []
-    for row in packed:
-        bits = np.unpackbits(row)[:L]
-        unpacked.append(bits.astype(bool))
-    return np.stack(unpacked, axis=0)
 
 
 def _load_existing_runs(data_path: Path) -> Tuple[Dict[Tuple[int, int], int], Dict[str, List]]:
@@ -178,51 +128,55 @@ def _save_runs(
 
 
 # -----------------------------------------------------------------------------
-# Model and basis helpers
+# Helpers
 # -----------------------------------------------------------------------------
 
-def _hamiltonian_dict_fn(model_name: str):
-    """Get the Hamiltonian dict constructor for a model."""
-    if model_name == "ising":
-        return models.ising_hamiltonian_dict
-    if model_name == "heisenberg":
-        return models.heisenberg_hamiltonian_dict
-    if model_name == "heisenberg_j2":
-        return models.heisenberg_j2_hamiltonian_dict
-    raise ValueError(f"Unknown model: {model_name}")
+def _stable_list_hash(items: List[str], n_chars: int = 16) -> str:
+    """Hash a list of strings for fingerprinting."""
+    payload = "\n".join(items).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()[:n_chars]
 
 
-def _model_params_from_args(args: argparse.Namespace) -> Dict[str, float]:
-    """Extract model-specific parameters from args."""
-    if args.model == "ising":
-        return {"J": float(args.J), "h": float(args.h), "k": float(args.k_ising)}
-    if args.model == "heisenberg":
-        return {}
-    if args.model == "heisenberg_j2":
-        return {"J2": float(args.J2)}
-    return {}
-
-
-def _build_basis_sets(
-    N: int,
-    start_level: int,
-    end_level: int,
-) -> Tuple[List, List, List]:
-    """Build starting_set, adding_set, and final_set.
+def _pack_masks(masks: List[np.ndarray]) -> np.ndarray:
+    """Bit-pack a list of boolean/int masks into a uint8 array.
+    
+    Args:
+        masks: List of 1D arrays of shape (L,) with 0/1 values.
     
     Returns:
-        (starting_set, adding_set, final_set)
+        2D uint8 array of shape (n_masks, ceil(L/8)).
     """
-    starting_set = generate_npa_basis(N=N, k=start_level).words
-    final_set = generate_npa_basis(N=N, k=end_level).words
+    if not masks:
+        return np.array([], dtype=np.uint8).reshape(0, 0)
     
-    # adding_set = monomials in final but not in starting
-    starting_set_set = set(tuple(w) if hasattr(w, '__iter__') and not isinstance(w, str) else w 
-                           for w in starting_set)
-    adding_set = [m for m in final_set if (tuple(m) if hasattr(m, '__iter__') and not isinstance(m, str) else m) 
-                  not in starting_set_set]
+    L = len(masks[0])
+    packed = []
+    for m in masks:
+        bits = np.packbits(m.astype(np.uint8))
+        packed.append(bits)
+    return np.stack(packed, axis=0)
+
+
+def _unpack_masks(packed: np.ndarray, L: int) -> np.ndarray:
+    """Unpack bit-packed masks back to boolean array.
     
-    return starting_set, adding_set, final_set
+    Args:
+        packed: 2D uint8 array of shape (n_masks, ceil(L/8)).
+        L: Original mask length.
+    
+    Returns:
+        2D bool array of shape (n_masks, L).
+    """
+    if packed.size == 0:
+        return np.array([], dtype=bool).reshape(0, L)
+    
+    unpacked = []
+    for row in packed:
+        bits = np.unpackbits(row)[:L]
+        unpacked.append(bits.astype(bool))
+    return np.stack(unpacked, axis=0)
+
+
 
 
 # -----------------------------------------------------------------------------
@@ -444,7 +398,9 @@ def compute_and_save(
         Path to the run directory.
     """
     # Build basis sets
-    starting_set, adding_set, final_set = _build_basis_sets(N, start_level, end_level)
+    starting_set, adding_set, final_set = build_npa_basis_sets(
+        N=N, start_level=start_level, end_level=end_level
+    )
     L = len(adding_set)
     
     if verbose:
@@ -498,7 +454,7 @@ def compute_and_save(
         return run_dir
     
     # Build Hamiltonian and objective
-    H_dict_fn = _hamiltonian_dict_fn(model_name)
+    H_dict_fn = hamiltonian_dict_fn(model_name)
     hamiltonian_dict = H_dict_fn(N=N, boundary=boundary, **model_params)
     
     obj_func = make_objective_function(
@@ -822,7 +778,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         # random method has no hyperparameters
         method_params = {}
     
-    model_params = _model_params_from_args(args)
+    model_params = model_params_from_args(args)
     
     run_dir = compute_and_save(
         N=args.N,

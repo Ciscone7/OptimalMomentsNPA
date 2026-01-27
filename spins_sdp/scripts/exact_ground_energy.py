@@ -27,19 +27,23 @@ from __future__ import annotations
 import argparse
 import platform
 import sys
-import time
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Tuple
 
 import numpy as np
 
-from spins_sdp import models
 from spins_sdp.scripts._artifact_io import (
     config_hash,
     load_records_npz,
     save_records_npz,
     upsert_meta_json,
     utc_now_iso,
+)
+from spins_sdp.scripts._common import (
+    hamiltonian_exact_fn,
+    model_params_from_args,
+    parse_ns_from_args,
+    time_best_avg,
 )
 
 
@@ -53,52 +57,6 @@ _FIELDS = {
     "t_best": np.dtype("float64"),
     "t_avg": np.dtype("float64"),
 }
-
-
-def _time_best_avg(fn, repeats: int) -> Tuple[float, float, float]:
-    times: List[float] = []
-    out: Optional[float] = None
-    for _ in range(repeats):
-        t0 = time.perf_counter()
-        out = fn()
-        times.append(time.perf_counter() - t0)
-    assert out is not None
-    return out, float(min(times)), float(sum(times) / len(times))
-
-
-def _parse_ns_from_args(args: argparse.Namespace) -> List[int]:
-    if args.Ns is not None and len(args.Ns) > 0:
-        Ns = list(args.Ns)
-    else:
-        if args.N_min is None or args.N_max is None:
-            raise SystemExit("Provide either --Ns or both --N-min and --N-max")
-        if args.N_min > args.N_max:
-            raise SystemExit("--N-min must be <= --N-max")
-        Ns = list(range(args.N_min, args.N_max + 1))
-
-    Ns = [int(n) for n in Ns]
-    if any(n <= 0 for n in Ns):
-        raise SystemExit("All N must be >= 1")
-    return sorted(set(Ns))
-
-
-def _hamiltonian_exact_fn(model_name: str):
-    if model_name == "ising":
-        return models.ising_hamiltonian_exact
-    if model_name == "heisenberg":
-        return models.heisenberg_hamiltonian_exact
-    if model_name == "heisenberg_j2":
-        return models.heisenberg_j2_hamiltonian_exact
-    raise ValueError(f"Unknown model: {model_name}")
-
-
-def _model_params_from_args(args: argparse.Namespace) -> Dict[str, float]:
-    if args.model == "ising":
-        return {"J": float(args.J), "h": float(args.h), "k": float(args.k)}
-    if args.model == "heisenberg":
-        return {}
-    # heisenberg_j2
-    return {"J2": float(args.J2)}
 
 
 def compute_and_save(
@@ -133,14 +91,14 @@ def compute_and_save(
     missing = [n for n in requested if (n not in existing) or force]
 
     # Compute missing
-    H_fn = _hamiltonian_exact_fn(model_name)
+    H_fn = hamiltonian_exact_fn(model_name)
     for N in missing:
         def run_one() -> float:
             H = H_fn(N, boundary=boundary, **model_params)
             evals = H.eigenenergies(eigvals=1)
             return float(np.asarray(evals)[0])
 
-        E0, tb, ta = _time_best_avg(run_one, repeats=repeats)
+        E0, tb, ta = time_best_avg(run_one, repeats=repeats)
         existing[int(N)] = {
             "dim": int(2**N),
             "E0": float(E0),
@@ -202,9 +160,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--force", action="store_true", help="Recompute requested N even if present")
 
     args = p.parse_args(argv)
-    Ns = _parse_ns_from_args(args)
+    Ns = parse_ns_from_args(args)
 
-    model_params = _model_params_from_args(args)
+    model_params = model_params_from_args(args)
 
     out_dir = compute_and_save(
         Ns=Ns,

@@ -28,13 +28,11 @@ import argparse
 import json
 import platform
 import sys
-import time
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
 
-from spins_sdp import models
 from spins_sdp.basis_builder import (
     generate_heisenberg_j2_basis_strong,
     generate_heisenberg_j2_basis_weak,
@@ -47,6 +45,12 @@ from spins_sdp.scripts._artifact_io import (
     save_records_npz,
     upsert_meta_json,
     utc_now_iso,
+)
+from spins_sdp.scripts._common import (
+    hamiltonian_dict_fn,
+    model_params_from_args,
+    parse_ns_from_args,
+    time_best_avg,
 )
 from spins_sdp.sdp import solve_pauli_relaxation
 
@@ -61,24 +65,6 @@ _FIELDS = {
     "t_best": np.dtype("float64"),
     "t_avg": np.dtype("float64"),
 }
-
-
-def _hamiltonian_dict_fn(model_name: str):
-    if model_name == "ising":
-        return models.ising_hamiltonian_dict
-    if model_name == "heisenberg":
-        return models.heisenberg_hamiltonian_dict
-    if model_name == "heisenberg_j2":
-        return models.heisenberg_j2_hamiltonian_dict
-    raise SystemExit(f"Unknown model: {model_name}")
-
-
-def _model_params_from_args(args: argparse.Namespace) -> Dict[str, float]:
-    if args.model == "ising":
-        return {"J": float(args.J), "h": float(args.h), "k": float(args.k)}
-    if args.model == "heisenberg":
-        return {}
-    return {"J2": float(args.J2)}
 
 
 def _basis_words(
@@ -103,31 +89,6 @@ def _basis_words(
     raise SystemExit(f"Unknown basis: {basis_name}")
 
 
-def _time_best_avg(fn, repeats: int) -> Tuple[float, float, float]:
-    times: List[float] = []
-    out: Optional[float] = None
-    for _ in range(repeats):
-        t0 = time.perf_counter()
-        out = fn()
-        times.append(time.perf_counter() - t0)
-    assert out is not None
-    return out, float(min(times)), float(sum(times) / len(times))
-
-
-def _parse_ns_from_args(args: argparse.Namespace) -> List[int]:
-    if args.Ns is not None and len(args.Ns) > 0:
-        Ns = list(args.Ns)
-    else:
-        if args.N_min is None or args.N_max is None:
-            raise SystemExit("Provide either --Ns or both --N-min and --N-max")
-        if args.N_min > args.N_max:
-            raise SystemExit("--N-min must be <= --N-max")
-        Ns = list(range(args.N_min, args.N_max + 1))
-
-    Ns = [int(n) for n in Ns]
-    if any(n <= 0 for n in Ns):
-        raise SystemExit("All N must be >= 1")
-    return sorted(set(Ns))
 
 def compute_and_save(
     *,
@@ -186,7 +147,7 @@ def compute_and_save(
     requested = sorted(set(int(n) for n in Ns))
     missing = [n for n in requested if (n not in existing) or force]
 
-    H_dict_fn = _hamiltonian_dict_fn(model_name)
+    H_dict_fn = hamiltonian_dict_fn(model_name)
 
     for N in missing:
         basis = _basis_words(basis_name=basis_name, N=N, level=npa_level, boundary=boundary)
@@ -203,7 +164,7 @@ def compute_and_save(
                 verbose=verbose,
             )
 
-        val, tb, ta = _time_best_avg(run_one, repeats=repeats)
+        val, tb, ta = time_best_avg(run_one, repeats=repeats)
         existing[int(N)] = {
             "basis_size": int(len(basis)),
             "E_lb": float(val),
@@ -284,9 +245,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--force", action="store_true")
 
     args = p.parse_args(argv)
-    Ns = _parse_ns_from_args(args)
+    Ns = parse_ns_from_args(args)
 
-    model_params = _model_params_from_args(args)
+    model_params = model_params_from_args(args)
 
     out_dir = compute_and_save(
         Ns=Ns,

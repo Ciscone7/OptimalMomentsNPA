@@ -855,29 +855,7 @@ def _load_optimization_data(run_dir: Path) -> Tuple[Dict[str, Any], Dict[str, np
     return meta, data
 
 
-def _compute_exact_ground_energy(
-    model: str,
-    N: int,
-    boundary: str,
-    model_params: Dict[str, float],
-) -> float:
-    """Compute exact ground state energy for a model."""
-    from spins_sdp import models
-    
-    if model == "ising":
-        H = models.ising_hamiltonian_exact(N, boundary=boundary, **model_params)
-    elif model == "heisenberg":
-        H = models.heisenberg_hamiltonian_exact(N, boundary=boundary)
-    elif model == "heisenberg_j2":
-        H = models.heisenberg_j2_hamiltonian_exact(N, boundary=boundary, **model_params)
-    else:
-        raise ValueError(f"Unknown model: {model}")
-    
-    eigenvalues = H.eigenenergies(eigvals=1)
-    return float(np.asarray(eigenvalues)[0])
-
-
-def _compute_full_relaxation_lower_bound(
+def _get_full_relaxation_lower_bound_from_artifact(
     *,
     model: str,
     N: int,
@@ -886,46 +864,67 @@ def _compute_full_relaxation_lower_bound(
     end_level: int,
     solver: str,
     mosek_tol: float,
+    results_root: Optional[Path] = None,
 ) -> float:
-    """Compute the SDP lower bound for the full relaxation (end_level basis).
+    """Load the SDP lower bound for the full relaxation (k=end_level) from artifacts.
 
-    This is used by convergence plots when the sweep did not include k=L.
+    Returns:
+        The energy if found, otherwise NaN.
     """
-    from spins_sdp import models
-    from spins_sdp.sdp import solve_pauli_relaxation
+    results_root = results_root or _default_results_root()
 
-    if model == "ising":
-        H = models.ising_hamiltonian_dict(N=N, boundary=boundary, **model_params)
-    elif model == "heisenberg":
-        H = models.heisenberg_hamiltonian_dict(N=N, boundary=boundary)
-    elif model == "heisenberg_j2":
-        H = models.heisenberg_j2_hamiltonian_dict(N=N, boundary=boundary, **model_params)
-    else:
-        raise ValueError(f"Unknown model: {model}")
+    meta_query: Dict[str, Any] = {
+        "artifact": "spin_moment_energy_lb",
+        "schema_version": 1,
+        "model": model,
+        "boundary": boundary,
+        "basis": "npa",
+        "npa_level": int(end_level),
+        "method": "pauli_moment_relaxation",
+        "sense": "min",
+        "solver": str(solver),
+        "mosek_tol": float(mosek_tol),
+    }
+    if model_params:
+        meta_query["params"] = {k: float(v) for k, v in model_params.items()}
 
-    full_basis = generate_npa_basis(N=N, k=int(end_level)).words
-    lb = solve_pauli_relaxation(
-        full_basis,
-        H,
-        sense="min",
-        solver=solver,
-        mosek_tol=float(mosek_tol),
-        verbose=False,
+    try:
+        run_dir = _find_run_dir(
+            results_root=results_root,
+            artifact="spin_moment_energy_lb",
+            schema_version=1,
+            meta_query=meta_query,
+        )
+        data = _load_npz(run_dir)
+        N_arr = np.asarray(data["N"], dtype=int)
+        E_lb = np.asarray(data["E_lb"], dtype=float)
+        idx = np.where(N_arr == int(N))[0]
+        if len(idx) > 0:
+            return float(E_lb[idx[0]])
+    except FileNotFoundError:
+        pass
+
+    params_msg = {k: float(v) for k, v in (model_params or {}).items()}
+    print(
+        "[WARN] Full-relaxation LB artifact not found (or missing requested N); "
+        "skipping full-relaxation line and relative-improvement panel. "
+        f"model={model!r} N={int(N)} boundary={boundary!r} end_level={int(end_level)} "
+        f"solver={str(solver)!r} mosek_tol={float(mosek_tol)} params={params_msg}"
     )
-    return float(lb)
+    return float("nan")
 
 
-def _get_exact_energy_from_artifact_or_compute(
+def _get_exact_energy_from_artifact(
     model: str,
     N: int,
     boundary: str,
     model_params: Dict[str, float],
     results_root: Path,
-) -> Tuple[float, str]:
-    """Try to load exact energy from artifact, otherwise compute it.
-    
+) -> Tuple[Optional[float], str]:
+    """Try to load exact energy from the exact-energy artifact.
+
     Returns:
-        (energy, source) where source is "artifact" or "computed"
+        (energy_or_none, source) where source is "artifact" or "missing".
     """
     try:
         exact_query = {
@@ -954,10 +953,13 @@ def _get_exact_energy_from_artifact_or_compute(
             return float(E0_arr[idx[0]]), "artifact"
     except FileNotFoundError:
         pass
-    
-    # Fall back to computing
-    E0 = _compute_exact_ground_energy(model, N, boundary, model_params)
-    return E0, "computed"
+
+    params_msg = {k: float(v) for k, v in (model_params or {}).items()}
+    print(
+        "[WARN] Exact-energy artifact not found (or missing requested N); "
+        f"skipping E0 line. model={model!r} N={int(N)} boundary={boundary!r} params={params_msg}"
+    )
+    return None, "missing"
 
 
 def plot_optimization_sweep(
@@ -1053,10 +1055,10 @@ def plot_optimization_sweep(
     L = meta.get("L", meta.get("adding_set_size"))
     starting_set_size = meta.get("starting_set_size", 0)
     
-    # Get exact energy
+    # Get exact energy (artifact-only). If missing, skip E0/gap plotting.
     E0_source = "provided"
     if exact_energy is None:
-        exact_energy, E0_source = _get_exact_energy_from_artifact_or_compute(
+        exact_energy, E0_source = _get_exact_energy_from_artifact(
             model=model,
             N=N,
             boundary=boundary,
@@ -1088,7 +1090,7 @@ def plot_optimization_sweep(
     
     # Prepare plot values
     if per_site:
-        E0_plot = exact_energy / N
+        E0_plot = (exact_energy / N) if exact_energy is not None else None
         best_vals_plot = best_vals / N
         ylabel = "Energy per site (E/N)"
     else:
@@ -1114,9 +1116,16 @@ def plot_optimization_sweep(
                 values = values / N
             ax1.scatter([k] * len(values), values, alpha=0.3, s=20, color="C0", zorder=2)
     
-    # Plot exact energy as horizontal line
-    ax1.axhline(E0_plot, color="red", linestyle="--", linewidth=2, 
-                label=f"Exact $E_0$ ({E0_source})", zorder=1)
+    # Plot exact energy as horizontal line (if available)
+    if E0_plot is not None:
+        ax1.axhline(
+            E0_plot,
+            color="red",
+            linestyle="--",
+            linewidth=2,
+            label=f"Exact $E_0$ ({E0_source})",
+            zorder=1,
+        )
     
     ax1.set_xlabel("Number of added monomials (k)")
     ax1.set_ylabel(ylabel)
@@ -1128,25 +1137,37 @@ def plot_optimization_sweep(
     # Right plot: Gap (E0 - LB) vs k
     ax2 = axes[1]
     
-    gap = exact_energy - best_vals
-    if per_site:
-        gap_plot = gap / N
-        gap_ylabel = "Gap per site ($E_0$ - LB)/N"
+    if exact_energy is not None:
+        gap = exact_energy - best_vals
+        if per_site:
+            gap_plot = gap / N
+            gap_ylabel = "Gap per site ($E_0$ - LB)/N"
+        else:
+            gap_plot = gap
+            gap_ylabel = "Gap ($E_0$ - LB)"
+
+        ax2.plot(ks_sorted, gap_plot, marker="^", linewidth=2, markersize=6, color="green")
+        ax2.axhline(0, color="gray", linestyle=":", linewidth=1)
+        ax2.set_xlabel("Number of added monomials (k)")
+        ax2.set_ylabel(gap_ylabel)
+        ax2.set_title("Relaxation Gap")
+        ax2.xaxis.set_major_locator(MaxNLocator(integer=True))
+        ax2.grid(True, alpha=0.3)
+
+        # Use log scale if all gaps are positive
+        if len(gap_plot) > 0 and np.all(gap_plot > 0):
+            ax2.set_yscale("log")
     else:
-        gap_plot = gap
-        gap_ylabel = "Gap ($E_0$ - LB)"
-    
-    ax2.plot(ks_sorted, gap_plot, marker="^", linewidth=2, markersize=6, color="green")
-    ax2.axhline(0, color="gray", linestyle=":", linewidth=1)
-    ax2.set_xlabel("Number of added monomials (k)")
-    ax2.set_ylabel(gap_ylabel)
-    ax2.set_title("Relaxation Gap")
-    ax2.xaxis.set_major_locator(MaxNLocator(integer=True))
-    ax2.grid(True, alpha=0.3)
-    
-    # Use log scale if all gaps are positive
-    if len(gap_plot) > 0 and np.all(gap_plot > 0):
-        ax2.set_yscale("log")
+        gap = None
+        ax2.set_axis_off()
+        ax2.text(
+            0.5,
+            0.5,
+            "Exact-energy artifact missing\n(gap not shown)",
+            ha="center",
+            va="center",
+            transform=ax2.transAxes,
+        )
     
     plt.tight_layout()
     
@@ -1242,11 +1263,14 @@ def plot_optimization_convergence(
     L = meta.get("L", meta.get("adding_set_size"))
     starting_set_size = meta.get("starting_set_size", 0)
     
-    # Get exact energy
+    # Get exact energy (artifact-only). If missing, skip E0 line.
     if exact_energy is None:
-        exact_energy, _ = _get_exact_energy_from_artifact_or_compute(
-            model=model, N=N, boundary=boundary,
-            model_params=model_params, results_root=results_root,
+        exact_energy, _ = _get_exact_energy_from_artifact(
+            model=model,
+            N=N,
+            boundary=boundary,
+            model_params=model_params,
+            results_root=results_root,
         )
     
     # Extract data
@@ -1261,27 +1285,31 @@ def plot_optimization_convergence(
     best_vals = np.array([best_per_k[k] for k in ks_sorted])
     
     # Get full relaxation energy (k=L). If the sweep didn't include k=L,
-    # compute the true full relaxation LB directly.
+    # try to load the true full-relaxation LB from artifacts.
     full_relaxation_label = "Full relaxation (k=L)"
+    full_relaxation_source = "data"
     if full_relaxation_energy is None:
         if L in best_per_k:
             full_relaxation_energy = best_per_k[L]
             full_relaxation_label = "Full relaxation (k=L)"
+            full_relaxation_source = "data"
         else:
-            try:
-                full_relaxation_energy = _compute_full_relaxation_lower_bound(
-                    model=model,
-                    N=int(N),
-                    boundary=boundary,
-                    model_params=model_params,
-                    end_level=end_level,
-                    solver=str(meta.get("solver", "MOSEK")),
-                    mosek_tol=float(meta.get("mosek_tol", 1e-9)),
-                )
+            full_relaxation_energy = _get_full_relaxation_lower_bound_from_artifact(
+                model=model,
+                N=int(N),
+                boundary=boundary,
+                model_params=model_params,
+                end_level=end_level,
+                solver=str(meta.get("solver", "MOSEK")),
+                mosek_tol=float(meta.get("mosek_tol", 1e-9)),
+                results_root=results_root,
+            )
+            if np.isfinite(float(full_relaxation_energy)):
                 full_relaxation_label = "Full relaxation (k=L)"
-            except Exception:
-                full_relaxation_energy = best_vals[-1]
-                full_relaxation_label = f"Best available (k={int(ks_sorted[-1])})"
+                full_relaxation_source = "artifact"
+            else:
+                full_relaxation_energy = None
+                full_relaxation_source = "missing"
     
     # Starting energy (k=0)
     starting_energy = best_per_k.get(0, best_vals[0])
@@ -1290,11 +1318,15 @@ def plot_optimization_convergence(
     fraction = ks_sorted / L if L > 0 else ks_sorted
     
     # Normalized improvement: 0 at k=0, 1 at k=L
-    total_improvement = full_relaxation_energy - starting_energy
-    if abs(total_improvement) > 1e-12:
-        normalized = (best_vals - starting_energy) / total_improvement
+    normalized: Optional[np.ndarray]
+    if full_relaxation_energy is None:
+        normalized = None
     else:
-        normalized = np.zeros_like(best_vals)
+        total_improvement = full_relaxation_energy - starting_energy
+        if abs(total_improvement) > 1e-12:
+            normalized = (best_vals - starting_energy) / total_improvement
+        else:
+            normalized = np.zeros_like(best_vals)
     
     # --- Plotting ---
     fig, axes = plt.subplots(1, 2, figsize=(14, 5))
@@ -1302,14 +1334,27 @@ def plot_optimization_convergence(
     # Left: Raw values vs fraction
     ax1 = axes[0]
     ax1.plot(fraction * 100, best_vals, marker="o", linewidth=2, label="Best LB")
-    ax1.axhline(exact_energy, color="red", linestyle="--", linewidth=2, label="Exact $E_0$")
-    ax1.axhline(
-        full_relaxation_energy,
-        color="green",
-        linestyle=":",
-        linewidth=2,
-        label=full_relaxation_label,
-    )
+    if exact_energy is not None:
+        ax1.axhline(exact_energy, color="red", linestyle="--", linewidth=2, label="Exact $E_0$")
+    if full_relaxation_energy is not None:
+        ax1.axhline(
+            full_relaxation_energy,
+            color="green",
+            linestyle=":",
+            linewidth=2,
+            label=full_relaxation_label,
+        )
+    else:
+        ax1.text(
+            0.02,
+            0.02,
+            "Full-relaxation artifact missing",
+            transform=ax1.transAxes,
+            fontsize=9,
+            color="green",
+            va="bottom",
+            ha="left",
+        )
     ax1.set_xlabel("Fraction of monomials added (%)")
     ax1.set_ylabel("Energy")
     ax1.set_title(f"{model.capitalize()} N={N}: Convergence")
@@ -1318,13 +1363,24 @@ def plot_optimization_convergence(
     
     # Right: Normalized improvement
     ax2 = axes[1]
-    ax2.plot(fraction * 100, normalized * 100, marker="o", linewidth=2, color="purple")
-    ax2.axhline(100, color="green", linestyle=":", linewidth=1)
-    ax2.set_xlabel("Fraction of monomials added (%)")
-    ax2.set_ylabel("% of total improvement achieved")
-    ax2.set_title("Relative Improvement")
-    ax2.set_ylim(-5, 105)
-    ax2.grid(True, alpha=0.3)
+    if normalized is None:
+        ax2.set_axis_off()
+        ax2.text(
+            0.5,
+            0.5,
+            "Full-relaxation artifact missing\n(relative improvement not shown)",
+            ha="center",
+            va="center",
+            transform=ax2.transAxes,
+        )
+    else:
+        ax2.plot(fraction * 100, normalized * 100, marker="o", linewidth=2, color="purple")
+        ax2.axhline(100, color="green", linestyle=":", linewidth=1)
+        ax2.set_xlabel("Fraction of monomials added (%)")
+        ax2.set_ylabel("% of total improvement achieved")
+        ax2.set_title("Relative Improvement")
+        ax2.set_ylim(-5, 105)
+        ax2.grid(True, alpha=0.3)
     
     plt.tight_layout()
     
@@ -1341,6 +1397,7 @@ def plot_optimization_convergence(
         "normalized_improvement": normalized,
         "exact_energy": exact_energy,
         "full_relaxation_energy": full_relaxation_energy,
+        "full_relaxation_energy_source": full_relaxation_source,
         "starting_energy": starting_energy,
         "L": L,
         "figure": fig,
@@ -1924,10 +1981,10 @@ def plot_optimization_vs_random(
     # Propagate uncertainty: std of difference
     improvement_std = np.sqrt(opt_std**2 + random_std**2)
     
-    # Get exact energy if not provided
+    # Get exact energy if not provided (artifact-only). If missing, skip E0/relative plots.
     E0_source = "provided"
     if exact_energy is None:
-        exact_energy, E0_source = _get_exact_energy_from_artifact_or_compute(
+        exact_energy, E0_source = _get_exact_energy_from_artifact(
             model=model,
             N=N,
             boundary=boundary,
@@ -1937,7 +1994,7 @@ def plot_optimization_vs_random(
     
     # Scale by N if per_site
     scale = N if per_site else 1
-    E0_plot = exact_energy / scale
+    E0_plot = (exact_energy / scale) if exact_energy is not None else None
     opt_mean_plot = opt_mean / scale
     opt_std_plot = opt_std / scale
     opt_min_plot = opt_min / scale
@@ -1976,8 +2033,14 @@ def plot_optimization_vs_random(
              color="C0", label=f"{optimization_method.upper()}: Mean", markersize=5)
     
     # Exact energy
-    ax1.axhline(E0_plot, color="green", linestyle="--", linewidth=2,
-                label=f"Exact $E_0$ ({E0_source})")
+    if E0_plot is not None:
+        ax1.axhline(
+            E0_plot,
+            color="green",
+            linestyle="--",
+            linewidth=2,
+            label=f"Exact $E_0$ ({E0_source})",
+        )
     
     ax1.set_xlabel("Number of added monomials (k)")
     ax1.set_ylabel(ylabel)
@@ -2007,29 +2070,39 @@ def plot_optimization_vs_random(
     # Right panel: Relative improvement (% of gap closed)
     ax3 = axes[2]
     
-    # Relative improvement: how much of the gap to exact did optimization close vs random?
-    # Gap for random: E0 - random_mean
-    # Gap for optimization: E0 - opt_mean
-    # Relative improvement = (random_gap - opt_gap) / random_gap * 100
-    #                      = (opt_mean - random_mean) / (E0 - random_mean) * 100
-    random_gap = exact_energy - random_mean
-    opt_gap = exact_energy - opt_mean
-    
-    # Avoid division by zero
-    with np.errstate(divide='ignore', invalid='ignore'):
-        relative_improvement = np.where(
-            np.abs(random_gap) > 1e-12,
-            (opt_mean - random_mean) / np.abs(random_gap) * 100,
-            0.0
+    if exact_energy is not None:
+        # Relative improvement: how much of the gap to exact did optimization close vs random?
+        # Gap for random: E0 - random_mean
+        # Gap for optimization: E0 - opt_mean
+        # Relative improvement = (opt_mean - random_mean) / (E0 - random_mean) * 100
+        random_gap = exact_energy - random_mean
+
+        # Avoid division by zero
+        with np.errstate(divide="ignore", invalid="ignore"):
+            relative_improvement = np.where(
+                np.abs(random_gap) > 1e-12,
+                (opt_mean - random_mean) / np.abs(random_gap) * 100,
+                0.0,
+            )
+
+        ax3.bar(common_ks, relative_improvement, color="C4", alpha=0.7, edgecolor="C4")
+        ax3.axhline(0, color="gray", linestyle=":", linewidth=1)
+        ax3.set_xlabel("Number of added monomials (k)")
+        ax3.set_ylabel("Relative Improvement (%)")
+        ax3.set_title("% of Random's Gap Closed by Optimization")
+        ax3.xaxis.set_major_locator(MaxNLocator(integer=True))
+        ax3.grid(True, alpha=0.3, axis="y")
+    else:
+        relative_improvement = np.full_like(common_ks, np.nan, dtype=float)
+        ax3.set_axis_off()
+        ax3.text(
+            0.5,
+            0.5,
+            "Exact-energy artifact missing\n(relative improvement not shown)",
+            ha="center",
+            va="center",
+            transform=ax3.transAxes,
         )
-    
-    ax3.bar(common_ks, relative_improvement, color="C4", alpha=0.7, edgecolor="C4")
-    ax3.axhline(0, color="gray", linestyle=":", linewidth=1)
-    ax3.set_xlabel("Number of added monomials (k)")
-    ax3.set_ylabel("Relative Improvement (%)")
-    ax3.set_title("% of Random's Gap Closed by Optimization")
-    ax3.xaxis.set_major_locator(MaxNLocator(integer=True))
-    ax3.grid(True, alpha=0.3, axis="y")
     
     plt.tight_layout()
     
@@ -2150,10 +2223,10 @@ def plot_method_comparison(
             f"No optimization runs found for {model} N={N}"
         )
     
-    # Get exact energy
+    # Get exact energy (artifact-only). If missing, skip E0 line.
     E0_source = "provided"
     if exact_energy is None:
-        exact_energy, E0_source = _get_exact_energy_from_artifact_or_compute(
+        exact_energy, E0_source = _get_exact_energy_from_artifact(
             model=model,
             N=N,
             boundary=boundary,
@@ -2198,9 +2271,15 @@ def plot_method_comparison(
         ax1.fill_between(ks, mean - std, mean + std, alpha=0.2, color=color)
         ax1.plot(ks, mean, marker="o", linewidth=2, color=color, 
                  label=f"{label}: Mean ± std", markersize=4)
-    
-    ax1.axhline(exact_energy / scale, color="green", linestyle="--", 
-                linewidth=2, label=f"Exact $E_0$ ({E0_source})")
+
+    if exact_energy is not None:
+        ax1.axhline(
+            exact_energy / scale,
+            color="green",
+            linestyle="--",
+            linewidth=2,
+            label=f"Exact $E_0$ ({E0_source})",
+        )
     
     ax1.set_xlabel("Number of added monomials (k)")
     ax1.set_ylabel(ylabel)

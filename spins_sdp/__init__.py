@@ -1,4 +1,4 @@
-from .exact_old import (
+from unused.exact_old import (
     magnetization_qutip,
     gibbs_state_from_spectrum
 )
@@ -10,8 +10,8 @@ from .models import (
     heisenberg_j2_hamiltonian_exact,
     heisenberg_j2_hamiltonian_dict,
 )
-from .pauli_strings import npa_level
-from .sdp_old import (
+from unused.pauli_strings import npa_level
+from unused.sdp_old import (
     moment_matrix_dict,
     build_sdp_variables,
     dict_to_cvxpy_matrix_from_expr,

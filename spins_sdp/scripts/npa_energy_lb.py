@@ -149,31 +149,6 @@ def compute_and_save(
 
     H_dict_fn = hamiltonian_dict_fn(model_name)
 
-    for N in missing:
-        basis = _basis_words(basis_name=basis_name, N=N, level=npa_level, boundary=boundary)
-        operator = H_dict_fn(N=N, boundary=boundary, **model_params)
-
-        def run_one() -> float:
-            return solve_pauli_relaxation(
-                basis,
-                operator,
-                sense="min",
-                solver=solver,
-                mosek_tol=mosek_tol,
-                solver_opts=solver_opts,
-                verbose=verbose,
-            )
-
-        val, tb, ta = time_best_avg(run_one, repeats=repeats)
-        existing[int(N)] = {
-            "basis_size": int(len(basis)),
-            "E_lb": float(val),
-            "t_best": float(tb),
-            "t_avg": float(ta),
-        }
-
-    save_records_npz(data_path, key="N", fields=_FIELDS, records=existing)
-
     meta: Dict[str, Any] = {
         **config,
         "config_hash": cfg_hash,
@@ -188,7 +163,45 @@ def compute_and_save(
         "Ns_present": sorted(existing.keys()),
     }
 
+    # Ensure meta.json exists early (useful on clusters) and is always updated.
     upsert_meta_json(meta_path, meta)
+
+    try:
+        for N in missing:
+            basis = _basis_words(basis_name=basis_name, N=N, level=npa_level, boundary=boundary)
+            operator = H_dict_fn(N=N, boundary=boundary, **model_params)
+
+            def run_one() -> float:
+                return solve_pauli_relaxation(
+                    basis,
+                    operator,
+                    sense="min",
+                    solver=solver,
+                    mosek_tol=mosek_tol,
+                    solver_opts=solver_opts,
+                    verbose=verbose,
+                )
+
+            val, tb, ta = time_best_avg(run_one, repeats=repeats)
+            existing[int(N)] = {
+                "basis_size": int(len(basis)),
+                "E_lb": float(val),
+                "t_best": float(tb),
+                "t_avg": float(ta),
+            }
+
+            # Checkpoint immediately: rewrite full NPZ atomically (temp + replace).
+            save_records_npz(data_path, key="N", fields=_FIELDS, records=existing)
+
+            # Also refresh metadata so partial runs are discoverable.
+            meta["Ns_present"] = sorted(existing.keys())
+            meta["updated_at"] = utc_now_iso()
+            upsert_meta_json(meta_path, meta)
+    finally:
+        meta["Ns_present"] = sorted(existing.keys())
+        meta["updated_at"] = utc_now_iso()
+        upsert_meta_json(meta_path, meta)
+
     return run_dir
 
 

@@ -487,63 +487,15 @@ def compute_and_save(
     
     # Run missing jobs
     pbar = tqdm(missing_jobs, desc="Optimization sweep", disable=not verbose)
-    for kv, s in pbar:
-        pbar.set_postfix({"k": kv, "seed": s})
-        
-        result = run_single_optimization(
-            obj_func=obj_func,
-            L=L,
-            k=kv,
-            seed=s,
-            method=method,
-            method_params=method_params,
-        )
-        
-        # Pack the mask
-        packed = np.packbits(result["mask"].astype(np.uint8))
-        
-        # Append results
-        run_idx_list.append(next_run_idx)
-        k_list.append(kv)
-        seed_list.append(s)
-        best_value_list.append(result["best_value"])
-        elapsed_s_list.append(result["elapsed_s"])
-        n_obj_evals_list.append(result["n_obj_evals"])
-        mask_bits_list.append(packed)
-        
-        next_run_idx += 1
-    
-    # Stack mask_bits into 2D array
-    if mask_bits_list:
-        # All packed masks should have the same length
-        mask_bits_arr = np.stack(mask_bits_list, axis=0)
-    else:
-        mask_bits_arr = np.array([], dtype=np.uint8).reshape(0, 0)
-    
-    # Save data
-    _save_runs(
-        data_path=data_path,
-        run_idx=run_idx_list,
-        k=k_list,
-        seed=seed_list,
-        best_value=best_value_list,
-        elapsed_s=elapsed_s_list,
-        n_obj_evals=n_obj_evals_list,
-        mask_bits=mask_bits_arr,
-    )
-    
-    # Build and save metadata
-    # Convert numpy types to native Python for JSON serialization
-    k_values_present = sorted(set(int(x) for x in k_list))
-    seeds_present = sorted(set(int(x) for x in seed_list))
-    
+
+    # Build metadata template once; we'll update counters and timestamps as we go.
     meta: Dict[str, Any] = {
         **config,
         "config_hash": cfg_hash,
         "k_values_requested": [int(x) for x in sorted(k_values)],
         "seeds_requested": [int(x) for x in sorted(seeds)],
-        "k_values_present": k_values_present,
-        "seeds_present": seeds_present,
+        "k_values_present": [],
+        "seeds_present": [],
         "total_runs": len(run_idx_list),
         "L": int(L),  # For decoding mask_bits
         "created_at": utc_now_iso(),
@@ -555,8 +507,62 @@ def compute_and_save(
             "machine": platform.machine(),
         },
     }
-    
+
+    # Ensure meta.json exists early and is always updated
+    # even if interrupted. Data is checkpointed every completed run.
     upsert_meta_json(meta_path, meta)
+
+    try:
+        for kv, s in pbar:
+            pbar.set_postfix({"k": kv, "seed": s})
+
+            result = run_single_optimization(
+                obj_func=obj_func,
+                L=L,
+                k=kv,
+                seed=s,
+                method=method,
+                method_params=method_params,
+            )
+
+            # Pack the mask
+            packed = np.packbits(result["mask"].astype(np.uint8))
+
+            # Append results
+            run_idx_list.append(next_run_idx)
+            k_list.append(kv)
+            seed_list.append(s)
+            best_value_list.append(result["best_value"])
+            elapsed_s_list.append(result["elapsed_s"])
+            n_obj_evals_list.append(result["n_obj_evals"])
+            mask_bits_list.append(packed)
+            next_run_idx += 1
+
+            # Checkpoint immediately: rewrite full NPZ atomically (temp + replace).
+            # This guarantees that after any crash, all completed datapoints up to
+            # the last successful checkpoint are present on disk.
+            if mask_bits_list:
+                mask_bits_arr = np.stack(mask_bits_list, axis=0)
+            else:
+                mask_bits_arr = np.array([], dtype=np.uint8).reshape(0, 0)
+
+            _save_runs(
+                data_path=data_path,
+                run_idx=run_idx_list,
+                k=k_list,
+                seed=seed_list,
+                best_value=best_value_list,
+                elapsed_s=elapsed_s_list,
+                n_obj_evals=n_obj_evals_list,
+                mask_bits=mask_bits_arr,
+            )
+    finally:
+        # Update metadata to reflect whatever is safely on disk.
+        meta["k_values_present"] = sorted(set(int(x) for x in k_list))
+        meta["seeds_present"] = sorted(set(int(x) for x in seed_list))
+        meta["total_runs"] = int(len(run_idx_list))
+        meta["updated_at"] = utc_now_iso()
+        upsert_meta_json(meta_path, meta)
     
     if verbose:
         print(f"\nResults saved to: {run_dir}")

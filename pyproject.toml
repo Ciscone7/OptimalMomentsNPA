@@ -18,6 +18,7 @@ dependencies = [
     "tqdm",
     "qutip",
     "pillow",
+    "physics-tenpy",
 ]
 
 [project.optional-dependencies]

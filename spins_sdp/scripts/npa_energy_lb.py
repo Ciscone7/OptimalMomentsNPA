@@ -32,6 +32,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
+from tqdm import tqdm
 
 from spins_sdp.basis_builder import (
     generate_heisenberg_j2_basis_strong,
@@ -163,11 +164,13 @@ def compute_and_save(
         "Ns_present": sorted(existing.keys()),
     }
 
-    # Ensure meta.json exists early (useful on clusters) and is always updated.
+    # Ensure meta.json exists early and is always updated.
     upsert_meta_json(meta_path, meta)
 
     try:
-        for N in missing:
+        pbar = tqdm(missing, desc="Moment relaxation sweep")
+        for N in pbar:
+            pbar.set_postfix({"N": int(N), "done": len(existing), "total": len(requested)})
             basis = _basis_words(basis_name=basis_name, N=N, level=npa_level, boundary=boundary)
             operator = H_dict_fn(N=N, boundary=boundary, **model_params)
 

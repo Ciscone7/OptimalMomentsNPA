@@ -43,9 +43,13 @@ echo "[1/4] Checking Python..."
 echo
 
 echo "[2/4] Creating virtual environment (.venv)..."
-if [[ -d "$VENV_DIR" ]]; then
-	echo "  .venv already exists; reusing it"
-else
+VENV_PY="${VENV_DIR}/bin/python"
+
+is_valid_venv() {
+	[[ -f "${VENV_DIR}/pyvenv.cfg" ]] && [[ -x "$VENV_PY" ]]
+}
+
+create_venv() {
 	if ! "$PYTHON_BIN" -m venv "$VENV_DIR"; then
 		echo
 		echo "ERROR: Failed to create venv. On Debian/Ubuntu you may need:" >&2
@@ -53,9 +57,19 @@ else
 		echo "Or use conda/mamba on the cluster." >&2
 		exit 1
 	fi
-fi
+}
 
-VENV_PY="${VENV_DIR}/bin/python"
+if [[ -d "$VENV_DIR" ]]; then
+	if is_valid_venv; then
+		echo "  .venv already exists; reusing it"
+	else
+		echo "  NOTE: .venv exists but looks broken (missing bin/python). Recreating..."
+		rm -rf "$VENV_DIR"
+		create_venv
+	fi
+else
+	create_venv
+fi
 
 echo "  Using: $VENV_PY"
 "$VENV_PY" --version

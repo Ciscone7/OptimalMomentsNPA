@@ -10,9 +10,9 @@
 
     "test_mode": {
         "_description": "Reduced parameters for quick testing/validation",
-        "enabled": true,
+        "enabled": false,
         "exact": {
-            "enabled": false,
+            "enabled": true,
             "N_min": 2,
             "N_max": 10
         },

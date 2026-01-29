@@ -8,9 +8,21 @@
 #
 # Usage (from repo root):
 #   bash spins_sdp/run/setup_env.sh
+#   bash spins_sdp/run/setup_env.sh --dev
 #
 
 set -euo pipefail
+
+INSTALL_DEV=0
+if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+	echo "Usage: bash spins_sdp/run/setup_env.sh [--dev]"
+	echo "  --dev   Also install requirements-dev.txt (notebooks/plotting/dev tools)"
+	exit 0
+fi
+if [[ "${1:-}" == "--dev" ]]; then
+	INSTALL_DEV=1
+	shift
+fi
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 VENV_DIR="${REPO_ROOT}/.venv"
@@ -57,6 +69,16 @@ if [[ -f "requirements.txt" ]]; then
 	"$VENV_PY" -m pip install -r requirements.txt
 else
 	echo "  NOTE: requirements.txt not found; installing from pyproject.toml only"
+fi
+
+if [[ "$INSTALL_DEV" == "1" ]]; then
+	echo
+	echo "  Installing dev dependencies (requirements-dev.txt)..."
+	if [[ -f "requirements-dev.txt" ]]; then
+		"$VENV_PY" -m pip install -r requirements-dev.txt
+	else
+		echo "  NOTE: requirements-dev.txt not found; skipping"
+	fi
 fi
 
 echo

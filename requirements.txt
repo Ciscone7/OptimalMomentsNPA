@@ -1,20 +1,21 @@
-cvxpy==1.6.6
-equinox
-h5py
-jax
-matplotlib
-mosek
+## Runtime dependencies (for running the experiment scripts on a cluster)
+## Install dev/notebook/plotting extras via requirements-dev.txt.
+
+# Core numerics
 numpy==2.3.0
-numpyencoder
-optax
-pandas==2.3.3
-scikit-learn
 scipy==1.15.3
 tqdm
-ipykernel
-ipython
-jupyterlab
+
+# SDP stack
+cvxpy==1.6.6
+mosek
+
+# Exact diagonalization (used by spins_sdp/models.py)
 qutip
-pillow
-black
+
+# DMRG (used by spins_sdp/variational.py and spins_sdp/scripts/dmrg.py)
 physics-tenpy
+
+# NOTE:
+# - pandas is optional now (only needed for dataframe helpers).
+# - scikit-learn is optional (only needed for --method bo in optimization_sweep).

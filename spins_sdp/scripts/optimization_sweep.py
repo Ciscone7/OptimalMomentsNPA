@@ -42,8 +42,10 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Mapping, Optional, Set, Tuple
 
 import numpy as np
-import pandas as pd
 from tqdm import tqdm
+
+if TYPE_CHECKING:
+    import pandas as pd
 
 from spins_sdp import models
 from spins_sdp.sdp import solve_pauli_relaxation
@@ -56,12 +58,22 @@ from spins_sdp.scripts._artifact_io import (
 from spins_sdp.scripts._common import build_npa_basis_sets, hamiltonian_dict_fn, model_params_from_args
 
 from src.optimalsdp.montecarlo import parallel_tempering, simulated_annealing
-from src.optimalsdp.bayesian import bayesian as bayesian_optimization
 
 
 
 SCHEMA_VERSION = 1
 ARTIFACT_NAME = "spin_optimization_sweep"
+
+
+def _require_pandas():
+    try:
+        import pandas as pd  # type: ignore
+    except ImportError as e:
+        raise ImportError(
+            "pandas is required for results_to_dataframe(). Install with `pip install pandas` "
+            "or `pip install -r requirements-dev.txt`."
+        ) from e
+    return pd
 
 
 # -----------------------------------------------------------------------------
@@ -303,6 +315,14 @@ def run_single_optimization(
 
     elif method == "bo":
         # Bayesian optimization
+
+        try:
+            from src.optimalsdp.bayesian import bayesian as bayesian_optimization
+        except ImportError as e:
+            raise ImportError(
+                "Bayesian optimization requires scikit-learn. Install with `pip install scikit-learn` "
+                "(or `pip install -r requirements-dev.txt`), or use --method sa/pt/random."
+            ) from e
 
         n_init = int(method_params.get("n_init", 20))
         n_iter = int(method_params.get("n_iter", 50))
@@ -629,7 +649,7 @@ def load_optimization_results(
     return {"meta": meta, "data": data}
 
 
-def results_to_dataframe(run_dir: Path) -> pd.DataFrame:
+def results_to_dataframe(run_dir: Path) -> "pd.DataFrame":
     """Load results as a pandas DataFrame.
     
     Args:
@@ -641,6 +661,8 @@ def results_to_dataframe(run_dir: Path) -> pd.DataFrame:
     """
     results = load_optimization_results(run_dir, unpack_masks=False)
     data = results["data"]
+
+    pd = _require_pandas()
     
     df = pd.DataFrame({
         "run_idx": data["run_idx"],

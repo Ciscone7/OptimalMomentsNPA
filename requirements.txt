@@ -18,4 +18,6 @@ physics-tenpy
 
 # NOTE:
 # - pandas is optional now (only needed for dataframe helpers).
-# - scikit-learn is optional (only needed for --method bo in optimization_sweep).
+
+# Bayesian optimization
+scikit-learn

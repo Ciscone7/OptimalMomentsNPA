@@ -33,6 +33,7 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 import sys
+import multiprocessing as mp
 from typing import Any, Dict, List, Tuple
 
 
@@ -142,6 +143,11 @@ def build_npa_basis_sets(N: int, start_level: int, end_level: int) -> Tuple[List
 def n_obj_evals_for_method(method: str, method_cfg: Dict[str, Any]) -> int:
     method = method.lower()
 
+    def _int(value, default: int) -> int:
+        if value is None:
+            return default
+        return int(value)
+
     if method == "random":
         return 1
 
@@ -152,9 +158,12 @@ def n_obj_evals_for_method(method: str, method_cfg: Dict[str, Any]) -> int:
     if method == "pt":
         # Matches optimization_sweep.py's accounting:
         # n_obj_evals = chains * epochs * steps_per_epoch + chains
-        chains = int(method_cfg.get("chains", method_cfg.get("num_chains", 4)))
-        epochs = int(method_cfg.get("epochs", method_cfg.get("num_epochs", 10)))
-        steps_per_epoch = int(method_cfg.get("steps_per_epoch", 50))
+        raw_chains = method_cfg.get("chains", method_cfg.get("num_chains"))
+        chains = _int(raw_chains, 0)
+        if chains <= 0:
+            chains = int(mp.cpu_count())
+        epochs = _int(method_cfg.get("epochs", method_cfg.get("num_epochs")), 10)
+        steps_per_epoch = _int(method_cfg.get("steps_per_epoch"), 50)
         return chains * epochs * steps_per_epoch + chains
 
     if method == "bo":
@@ -174,6 +183,9 @@ class Estimate:
     name: str
     n_sdps: int
     total_seconds: float
+    # Optional: approximate wall-clock seconds if some internal parallelism is assumed.
+    n_sdps_wall: int | None = None
+    total_seconds_wall: float | None = None
     notes: str = ""
 
 
@@ -215,12 +227,19 @@ def estimate_optimization(block: Dict[str, Any], fit: FitModel) -> Estimate | No
     Ns = list(cfg["Ns"])
     start_level = int(cfg["start_level"])
     end_level = int(cfg["end_level"])
+    k_min = int(cfg.get("k_min", 0))
     k_max = int(cfg["k_max"])
+    k_step = int(cfg.get("k_step", 1))
+    if k_step <= 0:
+        raise ValueError("optimization.k_step must be >= 1")
 
     methods = cfg.get("methods", {})
 
     total_seconds = 0.0
     total_sdps = 0
+
+    total_seconds_wall = 0.0
+    total_sdps_wall = 0
     out_of_fit = 0
     total_basis_calls = 0
 
@@ -229,16 +248,39 @@ def estimate_optimization(block: Dict[str, Any], fit: FitModel) -> Estimate | No
         starting_size = len(starting_set)
         adding_size = len(adding_set)
 
-        # The script sweeps k from 0..k_max (inclusive) but cannot exceed adding_set length.
+        # The script will run for each explicit k in the sweep.
+        # Cap to adding_set length to avoid impossible k.
         k_max_eff = min(k_max, adding_size)
-        k_values = list(range(0, k_max_eff + 1))
+        if k_min > k_max_eff:
+            continue
+        k_values = list(range(k_min, k_max_eff + 1, k_step))
 
         for method_name, method_cfg in methods.items():
             if not method_cfg.get("enabled", False):
                 continue
 
             num_seeds = int(method_cfg.get("num_seeds", 1))
+
+            # Total objective evaluations across the whole run.
             evals_per_run = n_obj_evals_for_method(method_name, method_cfg)
+
+            # Approximate wall-clock objective evaluations.
+            # For most methods this equals total evaluations.
+            # For PT we assume the chains run concurrently during the SA bursts, so wall-clock
+            # is closer to "one chain's work per epoch" plus the (currently serial) initial
+            # cost evaluation phase.
+            evals_per_run_wall = evals_per_run
+            if method_name.lower() == "pt":
+                raw_chains = method_cfg.get("chains", method_cfg.get("num_chains"))
+                chains = int(raw_chains) if raw_chains not in (None, "") else 0
+                if chains <= 0:
+                    chains = int(mp.cpu_count())
+                epochs = int(method_cfg.get("epochs", method_cfg.get("num_epochs", 10)))
+                steps_per_epoch = int(method_cfg.get("steps_per_epoch", 40))
+
+                # PT implementation evaluates the objective once per chain to initialize costs
+                # (currently done serially), then runs SA bursts in parallel.
+                evals_per_run_wall = chains + epochs * steps_per_epoch
 
             for k in k_values:
                 basis_size = starting_size + int(k)
@@ -253,6 +295,10 @@ def estimate_optimization(block: Dict[str, Any], fit: FitModel) -> Estimate | No
                 total_sdps += n_sdps_this_k
                 total_seconds += n_sdps_this_k * t_one_eval
 
+                n_sdps_this_k_wall = num_seeds * evals_per_run_wall
+                total_sdps_wall += n_sdps_this_k_wall
+                total_seconds_wall += n_sdps_this_k_wall * t_one_eval
+
     notes = ""
     if total_basis_calls and out_of_fit:
         notes = f"{out_of_fit}/{total_basis_calls} basis sizes outside fit window [{fit.fit_L_min},{fit.fit_L_max}]"
@@ -261,6 +307,8 @@ def estimate_optimization(block: Dict[str, Any], fit: FitModel) -> Estimate | No
         name="optimization",
         n_sdps=total_sdps,
         total_seconds=total_seconds,
+        n_sdps_wall=total_sdps_wall,
+        total_seconds_wall=total_seconds_wall,
         notes=notes,
     )
 
@@ -321,6 +369,19 @@ def main() -> int:
         print(line)
 
     print(f"- TOTAL: {total_sdps} SDPs, ~{_human_time(total_all)}")
+
+    # Optional wall-clock estimate if available.
+    if any(e.total_seconds_wall is not None for e in estimates):
+        print("\nApprox wall-clock (assumes PT chains run concurrently):")
+        total_all_wall = 0.0
+        total_sdps_wall_sum = 0
+        for e in estimates:
+            if e.total_seconds_wall is None or e.n_sdps_wall is None:
+                continue
+            total_all_wall += e.total_seconds_wall
+            total_sdps_wall_sum += e.n_sdps_wall
+            print(f"- {e.name}: ~{e.n_sdps_wall} effective SDPs, ~{_human_time(e.total_seconds_wall)}")
+        print(f"- TOTAL (wall): ~{total_sdps_wall_sum} effective SDPs, ~{_human_time(total_all_wall)}")
 
     if args.dry_run:
         print("\n(dry-run: not attempting to account for parallelism / scheduling)")

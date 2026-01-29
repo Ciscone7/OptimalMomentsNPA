@@ -14,6 +14,34 @@ import sys
 from pathlib import Path
 
 
+def _safe_int(value, default: int) -> int:
+    if value is None:
+        return default
+    return int(value)
+
+
+def _compute_ks(cfg: dict, *, adding_size: int | None) -> list[int]:
+    """Compute the list of k values to sweep.
+
+    Supports either:
+      - k_min/k_max/k_step (preferred)
+      - k_max only (falls back to 0..k_max)
+    """
+    k_max = int(cfg["k_max"])
+    k_min = int(cfg.get("k_min", 0))
+    k_step = int(cfg.get("k_step", 1))
+    if k_step <= 0:
+        raise ValueError("k_step must be >= 1")
+
+    k_max_eff = k_max
+    if adding_size is not None:
+        k_max_eff = min(k_max_eff, int(adding_size))
+
+    if k_min > k_max_eff:
+        return []
+    return list(range(k_min, k_max_eff + 1, k_step))
+
+
 def load_config(path: Path) -> dict:
     with open(path) as f:
         return json.load(f)
@@ -104,12 +132,33 @@ def run_optimization(cfg: dict, global_cfg: dict, dry_run: bool) -> None:
     print("\n[OPTIMIZATION] Running optimization sweeps...")
     
     Ns = cfg["Ns"]
-    k_max = cfg["k_max"]
-    start_level = cfg["start_level"]
-    end_level = cfg["end_level"]
+    start_level = int(cfg["start_level"])
+    end_level = int(cfg["end_level"])
     methods = cfg["methods"]
+
+    # If the user specified k_min/k_step, we must pass explicit --ks to the script.
+    # We'll also cap k to the length of the adding_set to avoid runtime errors.
+    adding_sizes_by_N: dict[int, int] = {}
+    try:
+        # Local import to keep runner lightweight.
+        from spins_sdp.basis_builder import generate_npa_basis
+
+        for N in Ns:
+            full_basis = generate_npa_basis(N=int(N), k=end_level)
+            adding_set = []
+            for level_idx in range(start_level + 1, min(end_level + 1, len(full_basis.levels))):
+                adding_set.extend(full_basis.levels[level_idx])
+            adding_sizes_by_N[int(N)] = len(adding_set)
+    except Exception:
+        # If basis generation fails for some reason, proceed without capping.
+        adding_sizes_by_N = {}
     
     for N in Ns:
+        ks = _compute_ks(cfg, adding_size=adding_sizes_by_N.get(int(N)))
+        if not ks:
+            print(f"\n  N={N}: no valid k values to run (check k_min/k_max/k_step)")
+            continue
+
         for method_name, method_cfg in methods.items():
             if not method_cfg.get("enabled", True):
                 continue
@@ -124,7 +173,7 @@ def run_optimization(cfg: dict, global_cfg: dict, dry_run: bool) -> None:
                 "--start-level", str(start_level),
                 "--end-level", str(end_level),
                 "--method", method_name,
-                "--k-max", str(k_max),
+                "--ks", *[str(k) for k in ks],
                 "--num-seeds", str(method_cfg.get("num_seeds", 10)),
             ]
             
@@ -133,10 +182,18 @@ def run_optimization(cfg: dict, global_cfg: dict, dry_run: bool) -> None:
                 cmd.extend(["--sa-steps", str(method_cfg.get("steps", 100))])
             elif method_name == "pt":
                 cmd.extend([
-                    "--pt-chains", str(method_cfg.get("chains", 4)),
-                    "--pt-epochs", str(method_cfg.get("epochs", 5)),
-                    "--pt-steps-per-epoch", str(method_cfg.get("steps_per_epoch", 50)),
+                    "--pt-epochs",
+                    str(_safe_int(method_cfg.get("epochs"), 10)),
+                    "--pt-steps-per-epoch",
+                    str(_safe_int(method_cfg.get("steps_per_epoch"), 40)),
                 ])
+                chains = method_cfg.get("chains")
+                if chains is not None and int(chains) > 0:
+                    cmd.extend(["--pt-chains", str(int(chains))])
+                if method_cfg.get("T_min") is not None:
+                    cmd.extend(["--pt-T-min", str(method_cfg["T_min"])])
+                if method_cfg.get("T_max") is not None:
+                    cmd.extend(["--pt-T-max", str(method_cfg["T_max"])])
             elif method_name == "bo":
                 cmd.extend([
                     "--bo-n-init", str(method_cfg.get("n_init", 10)),

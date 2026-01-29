@@ -746,7 +746,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--sa-alpha", type=float, default=0.95, help="SA: temperature decay factor")
     
     # PT parameters
-    p.add_argument("--pt-chains", type=int, default=4, help="PT: number of chains")
+    p.add_argument(
+        "--pt-chains",
+        type=int,
+        default=0,
+        help="PT: number of chains (0 = auto = use all CPUs)",
+    )
     p.add_argument("--pt-epochs", type=int, default=10, help="PT: number of epochs")
     p.add_argument("--pt-steps-per-epoch", type=int, default=50, help="PT: steps per epoch")
     p.add_argument("--pt-T-min", type=float, default=0.01, help="PT: minimum temperature")
@@ -811,8 +816,9 @@ def main(argv: Optional[List[str]] = None) -> int:
             "alpha": args.sa_alpha,
         }
     elif args.method == "pt":
+        pt_chains = None if int(args.pt_chains) <= 0 else int(args.pt_chains)
         method_params = {
-            "num_chains": args.pt_chains,
+            "num_chains": pt_chains,
             "num_epochs": args.pt_epochs,
             "steps_per_epoch": args.pt_steps_per_epoch,
             "T_min": args.pt_T_min,

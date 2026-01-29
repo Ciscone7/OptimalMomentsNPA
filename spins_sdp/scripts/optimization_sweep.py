@@ -183,37 +183,60 @@ def _unpack_masks(packed: np.ndarray, L: int) -> np.ndarray:
 # Objective function wrapper
 # -----------------------------------------------------------------------------
 
-def make_objective_function(
-    starting_set: List,
-    adding_set: List,
-    hamiltonian_dict: Dict,
-    solver: str = "MOSEK",
-    mosek_tol: float = 1e-9,
-) -> callable:
-    """Create the objective function for optimization.
+class OptimizationObjective:
+    """Picklable objective function for optimization.
     
     The objective takes a binary mask (0/1 array of length L=len(adding_set))
     and returns the SDP relaxation value for the corresponding basis.
     """
-    def objective(mask: np.ndarray) -> float:
+    def __init__(
+        self,
+        starting_set: List,
+        adding_set: List,
+        hamiltonian_dict: Dict,
+        solver: str = "MOSEK",
+        mosek_tol: float = 1e-9,
+    ):
+        self.starting_set = starting_set
+        self.adding_set = adding_set
+        self.hamiltonian_dict = hamiltonian_dict
+        self.solver = solver
+        self.mosek_tol = mosek_tol
+    
+    def __call__(self, mask: np.ndarray) -> float:
         # Select monomials where mask is 1
-        chosen = [m for val, m in zip(mask, adding_set) if val]
-        basis = starting_set + chosen
+        chosen = [m for val, m in zip(mask, self.adding_set) if val]
+        basis = self.starting_set + chosen
         
         lb = solve_pauli_relaxation(
             basis,
-            hamiltonian_dict,
+            self.hamiltonian_dict,
             sense="min",
-            solver=solver,
-            mosek_tol=mosek_tol,
+            solver=self.solver,
+            mosek_tol=self.mosek_tol,
             verbose=False,
         )
 
         # optimalsdp's Monte Carlo routines are minimizers.
         # Minimize loss = -LB to maximize the lower bound.
         return -float(lb)
-    
-    return objective
+
+
+def make_objective_function(
+    starting_set: List,
+    adding_set: List,
+    hamiltonian_dict: Dict,
+    solver: str = "MOSEK",
+    mosek_tol: float = 1e-9,
+) -> OptimizationObjective:
+    """Create the objective function for optimization."""
+    return OptimizationObjective(
+        starting_set=starting_set,
+        adding_set=adding_set,
+        hamiltonian_dict=hamiltonian_dict,
+        solver=solver,
+        mosek_tol=mosek_tol,
+    )
 
 
 # -----------------------------------------------------------------------------

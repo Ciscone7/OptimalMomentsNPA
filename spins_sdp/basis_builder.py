@@ -127,6 +127,8 @@ def _paper_default_r(N: int) -> int:
     """
     Paper choice: r = N/2 for N <= 60, and r = 20 for N = 80,100.
     """
+    if N<2:
+        return 1
     if N <= 60:
         return N // 2
     return 20
@@ -137,7 +139,7 @@ def generate_heisenberg_paper_basis(
     *,
     r: Optional[int] = None,
     include_degree3: bool = True,
-    include_degree4: Optional[bool] = None
+    include_degree4: bool = True
 ) -> List[PauliWord]:
     """
     Generate the monomial list used in the paper for the 1D Heisenberg chain (PBC).
@@ -163,9 +165,6 @@ def generate_heisenberg_paper_basis(
         raise ValueError("r must be >= 1.")
     if r > N - 1:
         r = N - 1  # distances beyond N-1 are redundant under modulo-N
-
-    if include_degree4 is None:
-        include_degree4 = True
 
     axes: Tuple[Axis, Axis, Axis] = ("x", "y", "z")
 
@@ -237,7 +236,7 @@ def generate_heisenberg_j2_basis_weak(
     *,
     r: Optional[int] = None,
     include_degree3: bool = True,
-    include_degree4: Optional[bool] = None
+    include_degree4: bool = True
 ) -> List[PauliWord]:
     """
     Generate the basis for Heisenberg chain with second-neighbor couplings (J_2 <= 1).

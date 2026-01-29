@@ -1,0 +1,88 @@
+{
+    "global_settings": {
+        "model":"heisenberg",
+        "model_params": {},
+        "solver": "MOSEK",
+        "resume": true,
+        "verbose": true,
+        "results_dir": "spins_sdp/results"
+    },
+
+    "test_mode": {
+        "_description": "Reduced parameters for quick testing/validation",
+        "enabled": true,
+        "exact": {
+            "enabled": false,
+            "N_min": 2,
+            "N_max": 10
+        },
+
+        "dmrg": {
+            "enabled": true,
+            "N_min": 2,
+            "N_max": 5,
+            "chi_max": 128,
+            "mixer": true
+        },
+
+        "full_relaxation": {
+            "enabled": true,
+            "Ns": [2,3,4],
+            "basis": "heisenberg_simple"
+        },
+
+        "optimization": {
+            "enabled": true,
+            "start_level": "1",
+            "end_level": "2",
+            "Ns": [4,6,8,10],
+            "k_max": 10,
+            "methods": {
+                "random": {"enabled": true, "num_seeds": 50},
+                "sa": {"enabled": true, "steps": 10, "num_seeds": 2},
+                "pt": {"enabled": true, "chains": 4, "epochs": 3, "steps_per_epoch": 10, "num_seeds": 2},
+                "bo": {"enabled": true, "n_init": 10, "n_iter": 10, "candidates_per_iter": 10, "num_seeds": 2}
+            }
+        }
+    },
+
+    "experiments": {
+        "exact": {
+            "_description": "Exact diagonalization settings",
+            "enabled": true,
+            "N_min": 2,
+            "N_max": 10
+        },
+
+        "dmrg": {
+            "_description": "DMRG settings",
+            "enabled": true,
+            "N_min": 2,
+            "N_max": 10,
+            "chi_max": 2048,
+            "mixer": true
+        },
+
+        "full_relaxation": {
+            "_description": "Energy relaxation settings",
+            "enabled": true,
+            "Ns": [2,3,4,5,6,7,8,9,10],
+            "basis": "heisenberg_simple"
+        },
+
+        "optimization": {
+            "_description": "Optimization settings",
+            "enabled": true,
+            "start_level": "1",
+            "end_level": "4",
+            "Ns": [4,6,8,10],
+            "k_max": 200,
+            "methods": {
+                "random": {"enabled": true, "num_seeds": 100},
+                "sa": {"enabled": true, "steps": 100, "num_seeds": 10},
+                "pt": {"enabled": true, "chains": 4, "epochs": 5, "steps_per_epoch": 50, "num_seeds": 10},
+                "bo": {"enabled": true, "n_init": 10, "n_iter": 30, "candidates_per_iter": 50, "num_seeds": 10}
+            }
+        }
+    }
+}

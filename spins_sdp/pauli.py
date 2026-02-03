@@ -1,6 +1,6 @@
 from __future__ import annotations
 from dataclasses import dataclass
-from typing import Final, Dict, List, Literal, Sequence, Tuple
+from typing import Final, Dict, List, Literal, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -38,6 +38,20 @@ class PauliWord:
     def support_size(self) -> int:
         """Number of non-identity sites."""
         return (self.x_mask | self.z_mask).bit_count()
+    
+    def signature(self) -> tuple[int, int]:
+        """
+        Returns (s_xy, s_yz) in {0, 1}.
+        0 means parity +1 (even number of flips, invariant).
+        1 means parity -1 (odd number of flips, changes sign).
+        """
+        # S_xy flips X and Y. This corresponds exactly to the x_mask bits.
+        s_xy = self.x_mask.bit_count() % 2
+        
+        # S_yz flips Y and Z. This corresponds exactly to the z_mask bits.
+        s_yz = self.z_mask.bit_count() % 2
+        
+        return (s_xy, s_yz)
     
     def __repr__(self) -> str:
         """
@@ -175,7 +189,10 @@ def local_pauli(site: int, axis: Axis) -> PauliWord:
 
 
 
-def compile_moment_matrix_rep(basis: List[PauliWord]) -> PauliMomentMatrixRep:
+def compile_moment_matrix_rep(
+        basis: List[PauliWord],
+        precomputed_label_index: Optional[Dict[PauliWord, int]] = None
+    ) -> PauliMomentMatrixRep:
     """
     Given basis monomials W=[w_i], build the compiled representation of the moment matrix:
       M_ij = <w_i^† w_j> = (known phase) * <u_ij>
@@ -184,6 +201,10 @@ def compile_moment_matrix_rep(basis: List[PauliWord]) -> PauliMomentMatrixRep:
     Output contains:
       - the set of required moment labels u (canonical Pauli words),
       - and for each (i,j) the label index plus the re/im phase coefficient.
+        M_{ij} = (A_{ij} + iB_{ij}) y_{u_{ij}}
+    
+    If precomputed_label_index is provided, it forces the representation to use 
+    these specific indices for moments.
     """
     n = len(basis)
     if n == 0:
@@ -191,28 +212,37 @@ def compile_moment_matrix_rep(basis: List[PauliWord]) -> PauliMomentMatrixRep:
 
     I = PauliWord(0, 0)
 
-    # First pass: collect all labels u_ij that appear in products w_i w_j (upper triangle)
-    label_set: set[PauliWord] = {I}
-    for i in range(n):
-        wi = basis[i]
-        for j in range(i, n):
-            wj = basis[j]
-            _, u = multiply_words(wi, wj)  # dagger is trivial for Pauli words
-            label_set.add(u)
-
-    # Label ordering: put I first, then by (support, x_mask, z_mask)
-    labels_rest = sorted(
-        (u for u in label_set if u != I),
-        key=lambda u: (u.support_size(), u.x_mask, u.z_mask),
-    )
-    labels = [I] + labels_rest
-    label_index = {u: k for k, u in enumerate(labels)}
+    if precomputed_label_index is None:
+        # Auto-discover labels
+        label_set: set[PauliWord] = {I}
+        for i in range(n):
+            wi = basis[i]
+            for j in range(i, n):
+                wj = basis[j]
+                _, u = multiply_words(wi, wj)
+                label_set.add(u)
+        
+        labels_rest = sorted(
+            (u for u in label_set if u != I),
+            key=lambda u: (u.support_size(), u.x_mask, u.z_mask),
+        )
+        labels = [I] + labels_rest
+        label_index = {u: k for k, u in enumerate(labels)}
+    else:
+        # Use the provided registry
+        label_index = precomputed_label_index
+        # Reconstruct the list 'labels' from the dict for the dataclass
+        labels = [None] * len(label_index)
+        for u, idx in label_index.items():
+            labels[idx] = u
+    # --- LOGIC BRANCHING END ---
+    
     idx_I = label_index[I]
 
     # Allocate compiled arrays
     label_idx = np.empty((n, n), dtype=np.int32)
-    a_coef = np.empty((n, n), dtype=np.int8)
-    b_coef = np.empty((n, n), dtype=np.int8)
+    A = np.empty((n, n), dtype=np.int8)
+    B = np.empty((n, n), dtype=np.int8)
 
     # Second pass: fill upper triangle, mirror using Hermitian structure
     for i in range(n):
@@ -227,21 +257,21 @@ def compile_moment_matrix_rep(basis: List[PauliWord]) -> PauliMomentMatrixRep:
             k = label_index[u]
 
             label_idx[i, j] = k
-            a_coef[i, j] = re
-            b_coef[i, j] = im
+            A[i, j] = re
+            B[i, j] = im
 
             # Hermitian completion: M_ji = conj(M_ij)
             label_idx[j, i] = k
-            a_coef[j, i] = re
-            b_coef[j, i] = -im
+            A[j, i] = re
+            B[j, i] = -im
 
     return PauliMomentMatrixRep(
         basis=basis,
         labels=labels,
         label_index=label_index,
         label_idx=label_idx,
-        a_coef=a_coef,
-        b_coef=b_coef,
+        a_coef=A,
+        b_coef=B,
         idx_I=idx_I,
     )
 

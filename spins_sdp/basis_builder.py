@@ -121,8 +121,6 @@ def generate_npa_basis(N: int, k: int) -> PauliNPABasis:
         index=index,
     )
 
-
-
 def _paper_default_r(N: int) -> int:
     """
     Paper choice: r = N/2 for N <= 60, and r = 20 for N = 80,100.
@@ -362,3 +360,22 @@ def generate_heisenberg_j2_basis_strong(
                         push(w)
 
     return out
+
+
+def split_basis_by_signature(basis: List[PauliWord]) -> Dict[tuple[int,int], List[PauliWord]]:
+    groups = {
+        (0,0): [], # ++
+        (0,1): [], # +-
+        (1,0): [], # -+
+        (1,1): []  # --
+    }
+    for w in basis:
+        sig = w.signature()
+        groups[sig].append(w)
+    return groups
+
+
+
+
+
+

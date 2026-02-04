@@ -8,7 +8,7 @@ import numpy as np
 import cvxpy as cp
 import scipy.sparse as sp
 
-from spins_sdp.pauli import compile_moment_matrix_rep, Operator, PauliMomentMatrixRep, PauliWord, multiply_words
+from spins_sdp.pauli import canonicalize_word, compile_moment_matrix_rep, Operator, PauliMomentMatrixRep, PauliWord, compile_moment_matrix_rep3, multiply_words
 
 
 # Later we will generalise this to account for the bell scenario
@@ -106,11 +106,13 @@ def build_sdp_from_rep(rep: PauliMomentMatrixRep,
     m = len(rep.labels)
     y = cp.Variable(m, name="y")  # real vector of moments
 
-    A, B, K = pauli_moment_matrix_real_embedding(rep, y)
-
     constraints: List[cp.Constraint] = []
+
     # Normalization: <I> = 1
     constraints.append(y[rep.idx_I] == 1.0)
+
+    A, B, K = pauli_moment_matrix_real_embedding(rep, y)
+
 
     # PSD constraint
     constraints.append(K >> 0)
@@ -353,6 +355,44 @@ def build_block_diagonal_sdp(
     constraints.append(y[reps[0].idx_I] == 1.0)
     
     for rep in reps:
+        
+        if rep.b_coef is None:
+            # Imaginary part is zero
+            n = rep.label_idx.shape[0]
+            
+            cols = rep.label_idx.reshape(-1, order="F").astype(np.int32)
+            dataA = rep.a_coef.reshape(-1, order="F").astype(float)
+            rows = np.arange(n * n, dtype=np.int32)
+
+            CA = sp.coo_matrix((dataA, (rows, cols)), shape=(n * n, m)).tocsr()
+
+            A_vec = cp.Constant(CA) @ y
+
+            # Explicit order matching column-major flattening
+            A = cp.reshape(A_vec, (n, n), order="F")
+            
+            constraints.append(A >> 0)
+            
+            # Objective: <objective_op> = c @ y
+            c = compile_operator_linear_form(rep, objective_op)
+            obj_expr = c @ y  # real scalar
+            
+            objective = cp.Minimize(obj_expr) if sense == "min" else cp.Maximize(obj_expr)
+            problem = cp.Problem(objective, constraints)
+
+            return PauliMomentSDP(
+                rep=rep,
+                y=y,
+                M_real=A,
+                M_imag=None,
+                PSD_block=None,
+                constraints=constraints,
+                objective=obj_expr,
+                problem=problem,
+            )
+            
+        # General case with imaginary part
+        
         # Build the embedding K for this specific block
         A, B, K = pauli_moment_matrix_real_embedding(rep, y)
         
@@ -429,11 +469,209 @@ def solve_block_diagonal_pauli_relaxation(
     return float(problem.value)
 
 
+# ----------------------------------
+# Permutation symmetry + block diagonalization
+# ----------------------------------
+
+def build_block_reps_with_permutation(full_basis: List[PauliWord]) -> Tuple[List[PauliMomentMatrixRep], Dict[PauliWord, int]]:
+    # Split Basis (Sign Symmetry)
+    blocks = {}
+    for w in full_basis:
+        blocks.setdefault(w.signature(), []).append(w)
+    
+    # Collect Global Labels
+    # We collect PAIRS: (original_u, canonical_u)
+    raw_to_canonical = {}
+    canonical_set = {PauliWord(0,0)}
+    
+    # Always map Identity to Identity
+    raw_to_canonical[PauliWord(0,0)] = PauliWord(0,0)
+
+    for sig, block_basis in blocks.items():
+        for i, w1 in enumerate(block_basis):
+            for w2 in block_basis[i:]:
+                _, u = multiply_words(w1, w2)
+                
+                if u not in raw_to_canonical:
+                    c = canonicalize_word(u)
+                    raw_to_canonical[u] = c
+                    canonical_set.add(c)
+
+    # Build Registry for CANONICAL words only
+    sorted_canons = sorted(list(canonical_set), key=lambda u: (u.support_size(), u.x_mask, u.z_mask))
+    
+    # Ensure I is at 0
+    if PauliWord(0,0) in sorted_canons:
+        sorted_canons.remove(PauliWord(0,0))
+    sorted_canons.insert(0, PauliWord(0,0))
+    
+    canonical_index = {u: i for i, u in enumerate(sorted_canons)}
+    
+    # Build the FINAL Global Index
+    # This maps every Raw U -> The index of its Canonical Representative
+    global_index = {u: canonical_index[c] for u, c in raw_to_canonical.items()}
+    
+    # Compile Blocks
+    reps = []
+    for sig in sorted(blocks.keys()):
+        if blocks[sig]:
+            # The compile function naturally uses the dict to look up indices.
+            # So if X0X1 and Z0Z1 are keys, they will both return index K.
+            reps.append(compile_moment_matrix_rep(blocks[sig], precomputed_label_index=global_index))
+            
+    return reps, global_index
+
+def solve_symmetric_pauli_relaxation(
+    full_basis: List[PauliWord],
+    operator: Operator,
+    sense: Sense = "min",
+    solver: str = "MOSEK",
+    mosek_tol: float = 1e-6,
+    solver_opts: Optional[Dict[str, Any]] = None,
+    verbose: bool = False,
+) -> float:
+    """
+    Solve a moment relaxation SDP exploiting both sign symmetry (blocks) 
+    and permutation symmetry (variable reduction).
+    
+    Args:
+        full_basis: List of Pauli words defining the full relaxation basis
+        operator: Objective operator as a Pauli word dictionary
+        sense: "min" or "max" optimization
+        solver: default "MOSEK"
+        mosek_tol: MOSEK conic tolerance
+        solver_opts: Override default solver options
+        verbose: Print solver output
+        
+    Returns:
+        Optimal objective value
+    """
+    
+    # Build Representations with Symmetry
+    reps, _ = build_block_reps_with_permutation(full_basis)
+    
+    # Build Block-Diagonal SDP
+    sdp = build_block_diagonal_sdp(reps, operator, sense=sense)
+    problem = sdp.problem
+    
+    default_solver_opts: Dict[str, Any] = {
+        "mosek_params": {
+            "MSK_DPAR_INTPNT_CO_TOL_REL_GAP": mosek_tol,
+            "MSK_DPAR_INTPNT_CO_TOL_PFEAS": mosek_tol,
+            "MSK_DPAR_INTPNT_CO_TOL_DFEAS": mosek_tol,
+        }
+    }
+    merged_solver_opts = dict(default_solver_opts)
+    if solver_opts:
+        merged_solver_opts.update(solver_opts)
+    
+    problem.solve(solver=solver, verbose=verbose, **merged_solver_opts)
+    
+    return float(problem.value)
 
 
 
+# ----------------------------------
+# Permutation symmetry + block diagonalization + sign flip symmetry
+# ----------------------------------
 
+def build_block_reps_3(full_basis: List[PauliWord]) -> Tuple[List[PauliMomentMatrixRep], Dict[PauliWord, int]]:
+    # Split Basis (Sign Symmetry)
+    blocks = {}
+    for w in full_basis:
+        blocks.setdefault(w.signature(), []).append(w)
+    
+    # Collect Global Labels
+    # We collect PAIRS: (original_u, canonical_u)
+    raw_to_canonical = {}
+    canonical_set = {PauliWord(0,0)}
+    
+    # Always map Identity to Identity
+    raw_to_canonical[PauliWord(0,0)] = PauliWord(0,0)
 
+    for sig, block_basis in blocks.items():
+        for i, w1 in enumerate(block_basis):
+            for w2 in block_basis[i:]:
+                _, u = multiply_words(w1, w2)
+                
+                # If u is variant, it's a zero. Don't add it to our registry
+                if u.is_variant_under_sign_symmetries():
+                    continue
+                
+                if u not in raw_to_canonical:
+                    c = canonicalize_word(u)
+                    raw_to_canonical[u] = c
+                    canonical_set.add(c)
 
+    # Build Registry for CANONICAL words only
+    sorted_canons = sorted(list(canonical_set), key=lambda u: (u.support_size(), u.x_mask, u.z_mask))
+    
+    # Ensure I is at 0
+    if PauliWord(0,0) in sorted_canons:
+        sorted_canons.remove(PauliWord(0,0))
+    sorted_canons.insert(0, PauliWord(0,0))
+    
+    canonical_index = {u: i for i, u in enumerate(sorted_canons)}
+    
+    # Build the FINAL Global Index
+    # This maps every Raw U -> The index of its Canonical Representative
+    global_index = {u: canonical_index[c] for u, c in raw_to_canonical.items()}
+    
+    # Compile Blocks
+    reps = []
+    for sig in sorted(blocks.keys()):
+        if blocks[sig]:
+            # The compile function naturally uses the dict to look up indices.
+            # So if X0X1 and Z0Z1 are keys, they will both return index K.
+            reps.append(compile_moment_matrix_rep3(blocks[sig], precomputed_label_index=global_index))
+            
+    return reps, global_index
 
+def solve_pauli_relaxation3(
+    full_basis: List[PauliWord],
+    operator: Operator,
+    sense: Sense = "min",
+    solver: str = "MOSEK",
+    mosek_tol: float = 1e-6,
+    solver_opts: Optional[Dict[str, Any]] = None,
+    verbose: bool = False,
+) -> float:
+    """
+    Solve a moment relaxation SDP exploiting both sign symmetry (blocks) 
+    and permutation symmetry (variable reduction).
+    
+    Args:
+        full_basis: List of Pauli words defining the full relaxation basis
+        operator: Objective operator as a Pauli word dictionary
+        sense: "min" or "max" optimization
+        solver: default "MOSEK"
+        mosek_tol: MOSEK conic tolerance
+        solver_opts: Override default solver options
+        verbose: Print solver output
+        
+    Returns:
+        Optimal objective value
+    """
+    
+    # Build Representations with 3 symmetries
+    reps, _ = build_block_reps_3(full_basis)
+    
+    # Build Block-Diagonal SDP
+    sdp = build_block_diagonal_sdp(reps, operator, sense=sense)
+    problem = sdp.problem
+    
+    default_solver_opts: Dict[str, Any] = {
+        "mosek_params": {
+            "MSK_DPAR_INTPNT_CO_TOL_REL_GAP": mosek_tol,
+            "MSK_DPAR_INTPNT_CO_TOL_PFEAS": mosek_tol,
+            "MSK_DPAR_INTPNT_CO_TOL_DFEAS": mosek_tol,
+        }
+    }
+    merged_solver_opts = dict(default_solver_opts)
+    if solver_opts:
+        merged_solver_opts.update(solver_opts)
+    
+    problem.solve(solver=solver, verbose=verbose, **merged_solver_opts)
+    
+    return float(problem.value)
 

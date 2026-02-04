@@ -1,9 +1,11 @@
 from __future__ import annotations
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import Final, Dict, List, Literal, Optional, Sequence, Tuple
 
 import numpy as np
 
+from itertools import permutations
 
 PhaseExp = int  # always interpreted mod 4
 
@@ -52,6 +54,19 @@ class PauliWord:
         s_yz = self.z_mask.bit_count() % 2
         
         return (s_xy, s_yz)
+    
+    def is_variant_under_sign_symmetries(self) -> bool:
+        """
+        Returns True if the expectation value <u> must be zero due to 
+        Hamiltonian sign symmetries (Appendix B.2.b).
+        
+        Theory: <u> != 0 only if Nx, Ny, and Nz are ALL even numbers.
+        """
+        nx = (self.x_mask & ~self.z_mask).bit_count()
+        ny = (self.x_mask & self.z_mask).bit_count()
+        nz = (~self.x_mask & self.z_mask).bit_count()
+        
+        return (nx % 2 != 0) or (ny % 2 != 0) or (nz % 2 != 0)
     
     def __repr__(self) -> str:
         """
@@ -116,11 +131,12 @@ class PauliMomentMatrixRep:
     label_index: Dict[PauliWord, int]      # u -> idx
     label_idx: np.ndarray                  # (n,n) int: which moment label is used at entry (i,j)
     a_coef: np.ndarray                     # (n,n) int8: Re coefficient in { -1,0,1 }
-    b_coef: np.ndarray                     # (n,n) int8: Im coefficient in { -1,0,1 }
+    b_coef: Optional[np.ndarray]           # (n,n) int8: Im coefficient in { -1,0,1 }
     idx_I: int                             # index of identity label
 
 Operator = Dict[PauliWord, complex]
 
+I_PAULI: Final[PauliWord] = PauliWord(0, 0)
 
 def multiply_words(a: PauliWord, b: PauliWord) -> tuple[PhaseExp, PauliWord]:
     """
@@ -167,7 +183,7 @@ def reduce_monomial(factors: Sequence[PauliWord]) -> PauliWord:
     """
     Multiply a list of factors and return only the *canonical word label*, discarding the global phase.
     """
-    w = PauliWord(0, 0)  # identity
+    w = I_PAULI  # identity
     for f in factors:
         _, w = multiply_words(w, f)
     return w
@@ -210,7 +226,7 @@ def compile_moment_matrix_rep(
     if n == 0:
         raise ValueError("Basis must be non-empty.")
 
-    I = PauliWord(0, 0)
+    I = I_PAULI
 
     if precomputed_label_index is None:
         # Auto-discover labels
@@ -276,7 +292,183 @@ def compile_moment_matrix_rep(
     )
 
 
+def compile_moment_matrix_rep3(
+        basis: List[PauliWord],
+        precomputed_label_index: Optional[Dict[PauliWord, int]] = None
+    ) -> PauliMomentMatrixRep:
+    """
+    Given basis monomials W=[w_i], build the compiled representation of the moment matrix:
+      M_ij = <w_i^† w_j> = (known phase) * <u_ij>
+    Since (reduced) Pauli words are Hermitian, w_i^† = w_i.
 
+    Output contains:
+      - the set of required moment labels u (canonical Pauli words),
+      - and for each (i,j) the label index plus the re/im phase coefficient.
+        M_{ij} = (A_{ij} + iB_{ij}) y_{u_{ij}}
+    
+    If precomputed_label_index is provided, it forces the representation to use 
+    these specific indices for moments.
+    """
+    n = len(basis)
+    if n == 0:
+        raise ValueError("Basis must be non-empty.")
+
+    I = I_PAULI
+
+    if precomputed_label_index is None:
+        # Auto-discover labels
+        label_set: set[PauliWord] = {I}
+        for i in range(n):
+            wi = basis[i]
+            for j in range(i, n):
+                wj = basis[j]
+                _, u = multiply_words(wi, wj)
+                
+                if not u.is_variant_under_sign_symmetries():
+                    label_set.add(u)
+        
+        labels_rest = sorted(
+            (u for u in label_set if u != I),
+            key=lambda u: (u.support_size(), u.x_mask, u.z_mask),
+        )
+        labels = [I] + labels_rest
+        label_index = {u: k for k, u in enumerate(labels)}
+    else:
+        # Use the provided registry
+        label_index = precomputed_label_index
+        # Reconstruct the list 'labels' from the dict for the dataclass
+        labels = [None] * len(label_index)
+        for u, idx in label_index.items():
+            labels[idx] = u
+    # --- LOGIC BRANCHING END ---
+    
+    idx_I = label_index[I]
+
+    # Allocate compiled arrays
+    label_idx = np.empty((n, n), dtype=np.int32)
+    A = np.empty((n, n), dtype=np.int8)
+    B = None  # All zeros, not needed
+
+    # Second pass: fill upper triangle, mirror using Hermitian structure
+    for i in range(n):
+        wi = basis[i]
+        for j in range(i, n):
+            wj = basis[j]
+            p, u = multiply_words(wi, wj)
+            
+            # Handle variant moments (STRUCTURAL ZEROS)
+            if u.is_variant_under_sign_symmetries():
+                # Hardcode entry to 0. Point index to I as a dummy.
+                # The coefficient 0 ensures the variable is effectively unused here.
+                label_idx[i, j] = idx_I 
+                A[i, j] = 0
+                
+                # Hermitian mirror
+                label_idx[j, i] = idx_I
+                A[j, i] = 0
+                continue  # Skip the rest of the loop
+            
+            re = _PHASE_RE[p]
+            im = _PHASE_IM[p]
+            
+            k = label_index[u]
+
+            label_idx[i, j] = k
+            A[i, j] = re
+
+            # Hermitian completion: M_ji = conj(M_ij)
+            label_idx[j, i] = k
+            A[j, i] = re
+
+    return PauliMomentMatrixRep(
+        basis=basis,
+        labels=labels,
+        label_index=label_index,
+        label_idx=label_idx,
+        a_coef=A,
+        b_coef=B,
+        idx_I=idx_I,
+    )
+
+
+
+
+
+def apply_permutation(w: PauliWord, p: Tuple[int, int, int]) -> PauliWord:
+    """
+    Apply a permutation p of axes (0,1,2) corresponding to (X,Y,Z).
+    p=(1,2,0) means: Old X->Y, Old Y->Z, Old Z->X.
+    """
+    # 1. Extract local operators
+    # We rebuild the masks from scratch
+    new_x_mask = 0
+    new_z_mask = 0
+    
+    # Iterate over all sites that have something
+    combined_mask = w.x_mask | w.z_mask
+    
+    if combined_mask == 0:
+        return w # Identity is invariant
+        
+    length = combined_mask.bit_length()
+    
+    for i in range(length):
+        bit = 1 << i
+        has_x = (w.x_mask & bit) != 0
+        has_z = (w.z_mask & bit) != 0
+        
+        if not (has_x or has_z):
+            continue
+            
+        # Determine current type: 0=X, 1=Y, 2=Z
+        # Based on: X(1,0), Z(0,1), Y(1,1)
+        if has_x and has_z:
+            current_type = 1 # Y
+        elif has_x:
+            current_type = 0 # X
+        else:
+            current_type = 2 # Z
+            
+        # Map to new type
+        new_type = p[current_type]
+        
+        # Write to new masks
+        # Map: 0->(1,0), 1->(1,1), 2->(0,1)
+        if new_type == 0: # X
+            new_x_mask |= bit
+        elif new_type == 1: # Y
+            new_x_mask |= bit
+            new_z_mask |= bit
+        elif new_type == 2: # Z
+            new_z_mask |= bit
+            
+    return PauliWord(new_x_mask, new_z_mask)
+
+@lru_cache(maxsize=None)
+def canonicalize_word(w: PauliWord) -> PauliWord:
+    """
+    Return the lexicographically smallest PauliWord in the S3 orbit of w.
+    """
+    # The 6 permutations of (0, 1, 2)
+    perms = [
+        (0,1,2), (0,2,1),
+        (1,0,2), (1,2,0),
+        (2,0,1), (2,1,0)
+    ]
+    
+    # We want to minimize the tuple representation (support_size, x_mask, z_mask)
+    # This ensures a consistent canonical representative.
+    best = w
+    best_key = (w.support_size(), w.x_mask, w.z_mask)
+    
+    for p in perms[1:]: # Skip identity
+        cand = apply_permutation(w, p)
+        cand_key = (cand.support_size(), cand.x_mask, cand.z_mask)
+        if cand_key < best_key:
+            best = cand
+            best_key = cand_key
+            
+    return best
 
 
 

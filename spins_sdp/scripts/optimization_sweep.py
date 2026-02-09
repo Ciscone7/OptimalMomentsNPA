@@ -34,10 +34,12 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import platform
 import random
 import sys
 import time
+import struct
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Mapping, Optional, Set, Tuple
 
@@ -55,7 +57,14 @@ from spins_sdp.scripts._artifact_io import (
     upsert_meta_json,
     utc_now_iso,
 )
-from spins_sdp.scripts._common import build_npa_basis_sets, hamiltonian_dict_fn, model_params_from_args
+from spins_sdp.scripts._common import (
+    add_symmetry_args,
+    build_npa_basis_sets,
+    hamiltonian_dict_fn,
+    model_params_from_args,
+    symmetry_config_from_args,
+)
+from spins_sdp.symmetry import SymmetryManager
 
 from src.optimalsdp.montecarlo import parallel_tempering, simulated_annealing
 
@@ -149,6 +158,27 @@ def _stable_list_hash(items: List[str], n_chars: int = 16) -> str:
     return hashlib.sha256(payload).hexdigest()[:n_chars]
 
 
+def _stable_pauliword_mask_hash(words: List[Any], *, N: int, n_chars: int = 16) -> str:
+    """Fast stable hash for PauliWord-like objects.
+
+    We hash the (x_mask, z_mask) integer bitmasks for each word.
+    This avoids expensive `str(word)` conversion when the adding set is huge
+    (e.g. end_level=NPA4).
+    """
+    h = hashlib.sha256()
+    h.update(struct.pack("<I", int(N)))
+
+    # Fixed-width encoding based on N bits.
+    n_bytes = max(1, (int(N) + 7) // 8)
+    for w in words:
+        x = int(getattr(w, "x_mask"))
+        z = int(getattr(w, "z_mask"))
+        h.update(x.to_bytes(n_bytes, byteorder="little", signed=False))
+        h.update(z.to_bytes(n_bytes, byteorder="little", signed=False))
+
+    return h.hexdigest()[:n_chars]
+
+
 def _pack_masks(masks: List[np.ndarray]) -> np.ndarray:
     """Bit-pack a list of boolean/int masks into a uint8 array.
     
@@ -196,7 +226,7 @@ def _unpack_masks(packed: np.ndarray, L: int) -> np.ndarray:
 # -----------------------------------------------------------------------------
 
 class OptimizationObjective:
-    """Picklable objective function for optimization.
+    """Objective function for optimization.
     
     The objective takes a binary mask (0/1 array of length L=len(adding_set))
     and returns the SDP relaxation value for the corresponding basis.
@@ -206,25 +236,33 @@ class OptimizationObjective:
         starting_set: List,
         adding_set: List,
         hamiltonian_dict: Dict,
-        solver: str = "MOSEK",
+        symmetry_manager: SymmetryManager,
         mosek_tol: float = 1e-9,
     ):
         self.starting_set = starting_set
         self.adding_set = adding_set
         self.hamiltonian_dict = hamiltonian_dict
-        self.solver = solver
+        self.symmetry_manager = symmetry_manager
         self.mosek_tol = mosek_tol
     
-    def __call__(self, mask: np.ndarray) -> float:
-        # Select monomials where mask is 1
-        chosen = [m for val, m in zip(mask, self.adding_set) if val]
+    def __call__(self, mask: Any) -> float:
+        # Accept either:
+        #   (A) a full 0/1 mask array of length L
+        #   (B) an iterable of selected indices (size k)
+        # For large L (e.g. end_level=NPA4), (B) avoids an O(L) scan per objective eval.
+        if isinstance(mask, np.ndarray):
+            mask_arr = mask
+            chosen_indices = np.flatnonzero(mask_arr)
+            chosen = [self.adding_set[int(i)] for i in chosen_indices]
+        else:
+            chosen = [self.adding_set[int(i)] for i in mask]
         basis = self.starting_set + chosen
         
         lb = solve_pauli_relaxation(
             basis,
             self.hamiltonian_dict,
+            symmetry_manager=self.symmetry_manager,
             sense="min",
-            solver=self.solver,
             mosek_tol=self.mosek_tol,
             verbose=False,
         )
@@ -238,7 +276,7 @@ def make_objective_function(
     starting_set: List,
     adding_set: List,
     hamiltonian_dict: Dict,
-    solver: str = "MOSEK",
+    symmetry_manager: SymmetryManager,
     mosek_tol: float = 1e-9,
 ) -> OptimizationObjective:
     """Create the objective function for optimization."""
@@ -246,7 +284,7 @@ def make_objective_function(
         starting_set=starting_set,
         adding_set=adding_set,
         hamiltonian_dict=hamiltonian_dict,
-        solver=solver,
+        symmetry_manager=symmetry_manager,
         mosek_tol=mosek_tol,
     )
 
@@ -291,27 +329,36 @@ def run_single_optimization(
             record_history=False,
             seed=seed,
             verbose=False,
+            obj_uses_indices=True,
         )
         n_obj_evals = method_params.get("steps", 100) + 1  # +1 for initial eval
         
     elif method == "pt":
+        pt_num_chains = method_params.get("num_chains", 4)
+
         result = parallel_tempering(
             obj_func=obj_func,
             N=L,
             k=k,
-            num_chains=method_params.get("num_chains", 4),
+            num_chains=pt_num_chains,
             num_epochs=method_params.get("num_epochs", 10),
             steps_per_epoch=method_params.get("steps_per_epoch", 50),
             T_min=method_params.get("T_min", 0.01),
             T_max=method_params.get("T_max", 2.0),
             seed=seed,
             verbose=False,
+            obj_uses_indices=True,
         )
         # Approximate: chains * epochs * steps_per_epoch + initial evals
-        n_chains = method_params.get("num_chains", 4)
+        n_chains_eval = pt_num_chains
+        if n_chains_eval is None or int(n_chains_eval) <= 0:
+            n_chains_eval = os.cpu_count() or 1
+        else:
+            n_chains_eval = int(n_chains_eval)
+
         n_epochs = method_params.get("num_epochs", 10)
         steps_per = method_params.get("steps_per_epoch", 50)
-        n_obj_evals = n_chains * n_epochs * steps_per + n_chains
+        n_obj_evals = n_chains_eval * n_epochs * steps_per + n_chains_eval
 
     elif method == "bo":
         # Bayesian optimization
@@ -410,7 +457,7 @@ def compute_and_save(
     method_params: Dict[str, Any],
     k_values: List[int],
     seeds: List[int],
-    solver: str,
+    symmetry_config: Dict[str, bool],
     mosek_tol: float,
     out_root: Path,
     resume: bool,
@@ -430,7 +477,7 @@ def compute_and_save(
         method_params: Optimization hyperparameters.
         k_values: List of k values to sweep.
         seeds: List of seeds for repetitions.
-        solver: SDP solver name.
+        symmetry_config: Symmetry configuration dict (excludes N).
         mosek_tol: Solver tolerance.
         out_root: Root directory for results.
         resume: If True, skip already-computed runs.
@@ -440,19 +487,15 @@ def compute_and_save(
     Returns:
         Path to the run directory.
     """
-    # Build basis sets
-    starting_set, adding_set, final_set = build_npa_basis_sets(
-        N=N, start_level=start_level, end_level=end_level
-    )
+    starting_set, adding_set, final_set = build_npa_basis_sets(N=N, start_level=start_level, end_level=end_level)
     L = len(adding_set)
     
     if verbose:
         print(f"Model: {model_name}, N={N}, boundary={boundary}")
         print(f"Starting set size: {len(starting_set)}, Adding set size: {L}, Final set size: {len(final_set)}")
-    
-    # Create fingerprint for adding_set
-    adding_set_strs = [str(m) for m in adding_set]
-    adding_set_hash = _stable_list_hash(adding_set_strs)
+
+    # Create fingerprint for adding_set (avoid slow stringification for large L)
+    adding_set_hash = _stable_pauliword_mask_hash(adding_set, N=N)
     
     # Build config for hashing
     config: Dict[str, Any] = {
@@ -469,7 +512,7 @@ def compute_and_save(
         "adding_set_hash": adding_set_hash,
         "method": method,
         "method_params": dict(sorted(method_params.items())),
-        "solver": solver,
+        "symmetry": symmetry_config,
         "mosek_tol": float(mosek_tol),
     }
     
@@ -479,7 +522,12 @@ def compute_and_save(
     data_path = run_dir / "data.npz"
     
     # Load existing runs
-    completed, existing_arrays = _load_existing_runs(data_path) if resume else ({}, {})
+    # - `force=True` should *recompute* the requested grid and overwrite the artifact,
+    #   not append duplicates (which makes "Total runs" misleading).
+    if force:
+        completed, existing_arrays = {}, {}
+    else:
+        completed, existing_arrays = _load_existing_runs(data_path) if resume else ({}, {})
     
     # Determine which (k, seed) pairs to compute
     all_jobs = [(kv, s) for kv in k_values for s in seeds]
@@ -489,7 +537,11 @@ def compute_and_save(
         missing_jobs = [(kv, s) for kv, s in all_jobs if (kv, s) not in completed]
     
     if verbose:
-        print(f"Total jobs: {len(all_jobs)}, Already done: {len(completed)}, To compute: {len(missing_jobs)}")
+        print(
+            f"Total jobs requested: {len(all_jobs)}, "
+            f"Already in artifact: {len(completed)}, "
+            f"To compute now: {len(missing_jobs)}"
+        )
     
     if not missing_jobs:
         if verbose:
@@ -500,11 +552,12 @@ def compute_and_save(
     H_dict_fn = hamiltonian_dict_fn(model_name)
     hamiltonian_dict = H_dict_fn(N=N, boundary=boundary, **model_params)
     
+    sym_manager = SymmetryManager(N=N, **symmetry_config)
     obj_func = make_objective_function(
         starting_set=starting_set,
         adding_set=adding_set,
         hamiltonian_dict=hamiltonian_dict,
-        solver=solver,
+        symmetry_manager=sym_manager,
         mosek_tol=mosek_tol,
     )
     
@@ -609,7 +662,10 @@ def compute_and_save(
     
     if verbose:
         print(f"\nResults saved to: {run_dir}")
-        print(f"Total runs: {len(run_idx_list)}")
+        print(
+            f"Total runs in artifact: {len(run_idx_list)} "
+            f"(requested this call: {len(all_jobs)}, computed this call: {len(missing_jobs)})"
+        )
     
     return run_dir
 
@@ -752,9 +808,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         default=0,
         help="PT: number of chains (0 = auto = use all CPUs)",
     )
-    p.add_argument("--pt-epochs", type=int, default=10, help="PT: number of epochs")
-    p.add_argument("--pt-steps-per-epoch", type=int, default=50, help="PT: steps per epoch")
-    p.add_argument("--pt-T-min", type=float, default=0.01, help="PT: minimum temperature")
+    p.add_argument("--pt-epochs", type=int, default=5, help="PT: number of epochs")
+    p.add_argument("--pt-steps-per-epoch", type=int, default=40, help="PT: steps per epoch")
+    p.add_argument("--pt-T-min", type=float, default=0.1, help="PT: minimum temperature")
     p.add_argument("--pt-T-max", type=float, default=2.0, help="PT: maximum temperature")
 
     # BO parameters
@@ -778,8 +834,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     seed_group.add_argument("--num-seeds", type=int, help="Number of seeds (starting from 42)")
     
     # Solver parameters
-    p.add_argument("--solver", type=str, default="MOSEK")
     p.add_argument("--mosek-tol", type=float, default=1e-9)
+
+    add_symmetry_args(p)
     
     # Output parameters
     p.add_argument(
@@ -836,6 +893,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         method_params = {}
     
     model_params = model_params_from_args(args)
+    symmetry_config = symmetry_config_from_args(args)
     
     run_dir = compute_and_save(
         N=args.N,
@@ -848,7 +906,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         method_params=method_params,
         k_values=k_values,
         seeds=seeds,
-        solver=args.solver,
+        symmetry_config=symmetry_config,
         mosek_tol=args.mosek_tol,
         out_root=args.out_root,
         resume=args.resume,

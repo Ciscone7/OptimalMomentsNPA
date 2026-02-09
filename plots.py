@@ -1546,6 +1546,7 @@ def plot_optimization_timing(
     start_level: int = 1,
     end_level: int = 2,
     method: str = "sa",
+    method_params: Optional[Dict[str, Any]] = None,
     results_root: Optional[Path] = None,
     show: bool = True,
     save_path: Optional[Path] = None,
@@ -1578,6 +1579,9 @@ def plot_optimization_timing(
         }
         if model_params:
             meta_query["model_params"] = {k: float(v) for k, v in model_params.items()}
+        if method_params:
+            # Subset match: you can provide only the keys you care about.
+            meta_query["method_params"] = dict(sorted(method_params.items()))
     
     run_dir = _find_optimization_run_dir(
         results_root=results_root,
@@ -1590,6 +1594,7 @@ def plot_optimization_timing(
     model = meta.get("model", model)
     N = meta.get("N", N)
     method = meta.get("method", method)
+    meta_method_params = meta.get("method_params", {})
     
     k_arr = data["k"]
     elapsed_arr = data["elapsed_s"]
@@ -1615,7 +1620,28 @@ def plot_optimization_timing(
     ax1.bar(ks_sorted, times, color="C2", alpha=0.7, edgecolor="C2")
     ax1.set_xlabel("Number of added monomials (k)")
     ax1.set_ylabel("Average time per run (seconds)")
-    ax1.set_title(f"{model.capitalize()} N={N}, method={method}: Timing")
+    title_suffix = ""
+    if isinstance(meta_method_params, dict) and len(meta_method_params) > 0:
+        # Keep title readable: only show common PT/SA keys if present.
+        keys_priority = [
+            "num_chains",
+            "num_epochs",
+            "steps_per_epoch",
+            "T_min",
+            "T_max",
+            "steps",
+            "T_start",
+            "alpha",
+        ]
+        shown = []
+        for k0 in keys_priority:
+            if k0 in meta_method_params:
+                shown.append(f"{k0}={meta_method_params[k0]}")
+        if not shown:
+            shown = [f"{k0}={v}" for k0, v in list(meta_method_params.items())[:4]]
+        title_suffix = " (" + ", ".join(shown) + ")"
+
+    ax1.set_title(f"{model.capitalize()} N={N}, method={method}: Timing{title_suffix}")
     ax1.xaxis.set_major_locator(MaxNLocator(integer=True))
     ax1.grid(True, alpha=0.3, axis="y")
     
@@ -1641,6 +1667,180 @@ def plot_optimization_timing(
         "avg_time_s": times,
         "avg_n_evals": evals,
         "time_per_eval_s": time_per_eval,
+        "figure": fig,
+        "axes": axes,
+    }
+
+
+def plot_pt_optimization_timing_by_k(
+    *,
+    run_hash: Optional[str] = None,
+    model: Optional[str] = None,
+    N: Optional[int] = None,
+    boundary: str = "periodic",
+    model_params: Optional[Dict[str, float]] = None,
+    start_level: int = 1,
+    end_level: int = 2,
+    pt_params: Optional[Dict[str, Any]] = None,
+    results_root: Optional[Path] = None,
+    show_points: bool = True,
+    logy: bool = False,
+    show: bool = True,
+    save_path: Optional[Path] = None,
+) -> Dict[str, Any]:
+    """Plot Parallel Tempering optimization wall-clock times vs k.
+
+    This is tailored for `--method pt` runs from `spins_sdp.scripts.optimization_sweep`.
+    It finds the matching artifact (by hash or by meta fields), then shows the
+    distribution of elapsed time across seeds for each k.
+
+    Args:
+        run_hash: Explicit run hash under spins_sdp/results/spin_optimization_sweep/v1/.
+        model, N, boundary, model_params, start_level, end_level: Identify the run.
+        pt_params: Optional subset of PT hyperparameters to match (e.g.
+            {"num_chains": 8, "num_epochs": 50, "steps_per_epoch": 50, "T_min": 0.1, "T_max": 10.0}).
+        show_points: If True, overlay individual seed points.
+        logy: If True, use log-scale for time axes.
+
+    Returns:
+        Dict containing the run_dir, meta, per-k timing arrays, and figure/axes.
+    """
+    results_root = results_root or _default_results_root()
+
+    meta_query = None
+    if run_hash is None:
+        if model is None or N is None:
+            raise ValueError("Provide either run_hash or (model, N)")
+        meta_query = {
+            "artifact": "spin_optimization_sweep",
+            "schema_version": 1,
+            "model": model,
+            "N": int(N),
+            "boundary": boundary,
+            "start_level": int(start_level),
+            "end_level": int(end_level),
+            "method": "pt",
+        }
+        if model_params:
+            meta_query["model_params"] = {k: float(v) for k, v in model_params.items()}
+        if pt_params:
+            meta_query["method_params"] = dict(sorted(pt_params.items()))
+
+    run_dir = _find_optimization_run_dir(
+        results_root=results_root,
+        run_hash=run_hash,
+        meta_query=meta_query,
+    )
+
+    meta, data = _load_optimization_data(run_dir)
+    model = meta.get("model", model)
+    N = int(meta.get("N", N))
+    method_params = meta.get("method_params", {})
+
+    k_arr = np.asarray(data["k"], dtype=int)
+    elapsed_arr = np.asarray(data["elapsed_s"], dtype=float)
+    seeds_arr = np.asarray(data.get("seed", np.zeros_like(k_arr)), dtype=int)
+    n_evals_arr = np.asarray(data.get("n_obj_evals", np.ones_like(k_arr)), dtype=float)
+
+    unique_ks = np.unique(k_arr)
+    ks_sorted = np.array(sorted(int(k) for k in unique_ks), dtype=int)
+
+    per_k_times: List[np.ndarray] = []
+    per_k_tpe: List[np.ndarray] = []
+    per_k_seeds: List[np.ndarray] = []
+    for k0 in ks_sorted:
+        mask = k_arr == int(k0)
+        t = elapsed_arr[mask]
+        e = n_evals_arr[mask]
+        per_k_times.append(t)
+        per_k_tpe.append(t / np.maximum(e, 1.0))
+        per_k_seeds.append(seeds_arr[mask])
+
+    rng = np.random.default_rng(0)
+
+    # Readable subtitle with common PT params
+    subtitle = ""
+    if isinstance(method_params, dict) and len(method_params) > 0:
+        keys = ["num_chains", "num_epochs", "steps_per_epoch", "T_min", "T_max"]
+        parts = [f"{k0}={method_params.get(k0)}" for k0 in keys if k0 in method_params]
+        if parts:
+            subtitle = ", ".join(parts)
+
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+    # Left: elapsed time distribution
+    ax1 = axes[0]
+    ax1.boxplot(
+        per_k_times,
+        labels=[str(k0) for k0 in ks_sorted],
+        showfliers=False,
+        medianprops={"color": "black", "linewidth": 1.5},
+        boxprops={"color": "C2"},
+        whiskerprops={"color": "C2"},
+        capprops={"color": "C2"},
+    )
+    if show_points:
+        for i, (k0, t) in enumerate(zip(ks_sorted, per_k_times), start=1):
+            # light jitter for readability
+            if len(t) == 0:
+                continue
+            x = rng.normal(loc=i, scale=0.06, size=len(t))
+            ax1.scatter(x, t, s=18, alpha=0.45, color="C2", edgecolors="none")
+
+    ax1.set_xlabel("Number of added monomials (k)")
+    ax1.set_ylabel("Elapsed time per run (seconds)")
+    title = f"{str(model).capitalize()} N={N}: PT optimization time vs k"
+    if subtitle:
+        title += f"\n{subtitle}"
+    ax1.set_title(title)
+    ax1.grid(True, alpha=0.25, axis="y")
+    if logy:
+        ax1.set_yscale("log")
+
+    # Right: time per objective evaluation (proxy for SDP solve cost)
+    ax2 = axes[1]
+    ax2.boxplot(
+        per_k_tpe,
+        labels=[str(k0) for k0 in ks_sorted],
+        showfliers=False,
+        medianprops={"color": "black", "linewidth": 1.5},
+        boxprops={"color": "C3"},
+        whiskerprops={"color": "C3"},
+        capprops={"color": "C3"},
+    )
+    if show_points:
+        for i, tpe in enumerate(per_k_tpe, start=1):
+            if len(tpe) == 0:
+                continue
+            x = rng.normal(loc=i, scale=0.06, size=len(tpe))
+            ax2.scatter(x, tpe, s=18, alpha=0.45, color="C3", edgecolors="none")
+
+    ax2.set_xlabel("Number of added monomials (k)")
+    ax2.set_ylabel("Time per objective eval (seconds)")
+    ax2.set_title("Cost per objective evaluation")
+    ax2.grid(True, alpha=0.25, axis="y")
+    if logy:
+        ax2.set_yscale("log")
+
+    plt.tight_layout()
+    if save_path is not None:
+        plt.savefig(save_path)
+    if show:
+        plt.show()
+
+    # Summary stats (median)
+    median_time = np.array([float(np.median(t)) if len(t) else float("nan") for t in per_k_times])
+    median_tpe = np.array([float(np.median(t)) if len(t) else float("nan") for t in per_k_tpe])
+
+    return {
+        "run_dir": run_dir,
+        "meta": meta,
+        "k": ks_sorted,
+        "per_k_elapsed_s": per_k_times,
+        "per_k_time_per_eval_s": per_k_tpe,
+        "per_k_seeds": per_k_seeds,
+        "median_elapsed_s": median_time,
+        "median_time_per_eval_s": median_tpe,
         "figure": fig,
         "axes": axes,
     }
@@ -2304,3 +2504,736 @@ def plot_method_comparison(
         "figure": fig,
         "axes": [ax1],
     }
+
+
+# =============================================================================
+# Symmetry Benchmark Plotting
+# =============================================================================
+
+SYM_LEVEL_NAMES = {
+    0: "No Symmetry",
+    1: "+Real",
+    2: "+Rotation",
+    3: "+Sign",
+    4: "+Permutation",
+    5: "+Translation",
+    6: "+Mirror (All)",
+}
+
+SYM_COLORS = ['red', 'blue', 'green', 'purple', 'orange', 'brown', 'black']
+SYM_MARKERS = ['o', 's', '^', 'd', 'h', 'p', 'x']
+
+
+def find_symmetry_benchmark(
+    *,
+    model: str = "heisenberg",
+    basis: str = "npa",
+    npa_level: Optional[int] = 2,
+    boundary: str = "periodic",
+    results_root: Optional[Path] = None,
+) -> Optional[Path]:
+    """Find a symmetry benchmark run matching the given parameters.
+    
+    Args:
+        model: Model name ('heisenberg' or 'ising').
+        basis: Basis name ('npa', 'heisenberg_simple', 'heisenberg_j2_weak', 'heisenberg_j2_strong').
+        npa_level: NPA level (only used when basis='npa').
+        boundary: Boundary condition ('open' or 'periodic').
+        results_root: Root directory for results.
+    
+    Returns:
+        Path to run directory if found, None otherwise.
+    """
+    if results_root is None:
+        results_root = _default_results_root()
+    
+    base = results_root / "spin_symmetry_benchmark" / "v1"
+    if not base.exists():
+        return None
+    
+    for run_dir in base.iterdir():
+        if not run_dir.is_dir():
+            continue
+        meta_path = run_dir / "meta.json"
+        if not meta_path.exists():
+            continue
+        
+        meta = _load_meta(run_dir)
+        
+        # Match model and boundary
+        if meta.get("model") != model or meta.get("boundary") != boundary:
+            continue
+        
+        # Match basis
+        if meta.get("basis") != basis:
+            continue
+        
+        # For NPA basis, also match npa_level
+        if basis == "npa" and meta.get("npa_level") != npa_level:
+            continue
+        
+        return run_dir
+    
+    return None
+
+
+def load_symmetry_benchmark(
+    run_dir: Optional[Path] = None,
+    *,
+    model: str = "heisenberg",
+    basis: str = "npa",
+    npa_level: Optional[int] = 2,
+    boundary: str = "periodic",
+    results_root: Optional[Path] = None,
+) -> Dict[str, Any]:
+    """Load symmetry benchmark results.
+    
+    Args:
+        run_dir: Direct path to run directory. If None, searches for matching run.
+        model: Model name to search for.
+        basis: Basis name ('npa', 'heisenberg_simple', etc.).
+        npa_level: NPA level to search for (only used when basis='npa').
+        boundary: Boundary condition to search for.
+        results_root: Root results directory.
+    
+    Returns:
+        Dict with 'meta' and 'data' keys.
+    """
+    if run_dir is None:
+        run_dir = find_symmetry_benchmark(
+            model=model, basis=basis, npa_level=npa_level, boundary=boundary, results_root=results_root
+        )
+        if run_dir is None:
+            basis_desc = f"NPA level {npa_level}" if basis == "npa" else basis
+            raise FileNotFoundError(
+                f"No symmetry benchmark found for model={model}, basis={basis_desc}, boundary={boundary}"
+            )
+    
+    meta = _load_meta(run_dir)
+    data = _load_npz(run_dir)
+    
+    return {"meta": meta, "data": data, "run_dir": run_dir}
+
+
+def plot_symmetry_speedup(
+    run_dir: Optional[Path] = None,
+    *,
+    model: str = "heisenberg",
+    basis: str = "npa",
+    npa_level: Optional[int] = 2,
+    boundary: str = "periodic",
+    results_root: Optional[Path] = None,
+    time_column: str = "t_best",
+    show: bool = True,
+    save_path: Optional[Path] = None,
+) -> Dict[str, Any]:
+    """Plot SDP solve time vs N for different symmetry levels.
+    
+    Args:
+        run_dir: Direct path to run directory. If None, searches for matching run.
+        model: Model name.
+        basis: Basis name ('npa', 'heisenberg_simple', etc.).
+        npa_level: NPA level (only used when basis='npa').
+        boundary: Boundary condition.
+        results_root: Root results directory.
+        time_column: Which time to use ('t_best', 't_avg', 't_total').
+        show: Whether to call plt.show().
+        save_path: Optional path to save the figure.
+    
+    Returns:
+        Dict with figure, axes, and data.
+    """
+    result = load_symmetry_benchmark(
+        run_dir, model=model, basis=basis, npa_level=npa_level, boundary=boundary, results_root=results_root
+    )
+    meta = result["meta"]
+    data = result["data"]
+    
+    # Organize data by symmetry level
+    levels = sorted(set(data["sym_level"]))
+    
+    fig, ax = plt.subplots(figsize=(12, 7))
+    
+    for i, level in enumerate(levels):
+        mask = data["sym_level"] == level
+        N_vals = data["N"][mask]
+        times = data[time_column][mask]
+        
+        # Sort by N
+        sort_idx = np.argsort(N_vals)
+        N_vals = N_vals[sort_idx]
+        times = times[sort_idx]
+        
+        color = SYM_COLORS[level % len(SYM_COLORS)]
+        marker = SYM_MARKERS[level % len(SYM_MARKERS)]
+        label = SYM_LEVEL_NAMES.get(level, f"Sym {level}")
+        
+        style = '--' if level == 0 else '-'
+        alpha = 0.6 if level == 0 else 0.9
+        lw = 1 if level == 0 else 2
+        
+        ax.plot(N_vals, times, f'{marker}{style}', label=label, 
+                color=color, alpha=alpha, linewidth=lw, markersize=6)
+    
+    ax.set_xlabel('System Size (N)', fontsize=12)
+    ax.set_ylabel('Solve Time (seconds)', fontsize=12)
+    basis_desc = f"NPA level {npa_level}" if basis == "npa" else basis.replace("_", " ").title()
+    ax.set_title(f'{model.capitalize()} Chain SDP: Symmetry Speedup ({basis_desc})', fontsize=14)
+    ax.set_yscale('log')
+    ax.grid(True, which="both", ls="-", alpha=0.4)
+    ax.legend(loc='upper left', fontsize=10)
+    
+    plt.tight_layout()
+    
+    if save_path is not None:
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    if show:
+        plt.show()
+    
+    return {
+        "meta": meta,
+        "data": data,
+        "figure": fig,
+        "axes": ax,
+    }
+
+
+def plot_symmetry_variable_reduction(
+    run_dir: Optional[Path] = None,
+    *,
+    model: str = "heisenberg",
+    basis: str = "npa",
+    npa_level: Optional[int] = 2,
+    boundary: str = "periodic",
+    results_root: Optional[Path] = None,
+    show: bool = True,
+    save_path: Optional[Path] = None,
+) -> Dict[str, Any]:
+    """Plot SDP variable count vs N for different symmetry levels.
+    
+    Creates two subplots:
+    1. Absolute variable counts
+    2. Reduction factor relative to no symmetry
+    
+    Args:
+        run_dir: Direct path to run directory.
+        model: Model name.
+        basis: Basis name ('npa', 'heisenberg_simple', etc.).
+        npa_level: NPA level (only used when basis='npa').
+        boundary: Boundary condition.
+        results_root: Root results directory.
+        show: Whether to call plt.show().
+        save_path: Optional path to save the figure.
+    
+    Returns:
+        Dict with figure, axes, and data.
+    """
+    result = load_symmetry_benchmark(
+        run_dir, model=model, basis=basis, npa_level=npa_level, boundary=boundary, results_root=results_root
+    )
+    meta = result["meta"]
+    data = result["data"]
+    
+    levels = sorted(set(data["sym_level"]))
+    
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+    
+    # Get baseline (level 0) for reduction calculation
+    baseline_by_N = {}
+    mask0 = data["sym_level"] == 0
+    for N, nv in zip(data["N"][mask0], data["n_vars"][mask0]):
+        baseline_by_N[N] = nv
+    
+    for level in levels:
+        mask = data["sym_level"] == level
+        N_vals = data["N"][mask]
+        n_vars = data["n_vars"][mask]
+        
+        sort_idx = np.argsort(N_vals)
+        N_vals = N_vals[sort_idx]
+        n_vars = n_vars[sort_idx]
+        
+        color = SYM_COLORS[level % len(SYM_COLORS)]
+        marker = SYM_MARKERS[level % len(SYM_MARKERS)]
+        label = SYM_LEVEL_NAMES.get(level, f"Sym {level}")
+        
+        # Absolute counts
+        ax1.plot(N_vals, n_vars, f'{marker}-', label=label, color=color, linewidth=2, markersize=6)
+        
+        # Reduction factor (skip level 0)
+        if level > 0:
+            reduction = np.array([baseline_by_N.get(N, np.nan) / nv for N, nv in zip(N_vals, n_vars)])
+            valid = ~np.isnan(reduction)
+            ax2.plot(N_vals[valid], reduction[valid], f'{marker}-', label=label, 
+                     color=color, linewidth=2, markersize=6)
+    
+    ax1.set_yscale('log')
+    ax1.set_xlabel('Number of Spins (N)', fontsize=12)
+    ax1.set_ylabel('Number of SDP Variables', fontsize=12)
+    ax1.set_title('Variable Count by Symmetry', fontsize=13)
+    ax1.grid(True, which="both", ls="-", alpha=0.4)
+    ax1.legend(fontsize=9)
+    
+    ax2.set_xlabel('Number of Spins (N)', fontsize=12)
+    ax2.set_ylabel('Variable Reduction Factor', fontsize=12)
+    ax2.set_title('Symmetry Reduction Factor (vs No Symmetry)', fontsize=13)
+    ax2.grid(True, which="both", ls="-", alpha=0.4)
+    ax2.legend(fontsize=9)
+    
+    plt.tight_layout()
+    
+    if save_path is not None:
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    if show:
+        plt.show()
+    
+    return {
+        "meta": meta,
+        "data": data,
+        "figure": fig,
+        "axes": [ax1, ax2],
+    }
+
+
+def fit_symmetry_scaling(
+    run_dir: Optional[Path] = None,
+    *,
+    model: str = "heisenberg",
+    basis: str = "npa",
+    npa_level: Optional[int] = 2,
+    boundary: str = "periodic",
+    results_root: Optional[Path] = None,
+    sym_level: int = 6,
+    fit_N_min: int = 4,
+    fit_N_max: Optional[int] = None,
+    time_column: str = "t_best",
+) -> Dict[str, Any]:
+    """Fit a power-law scaling t = a * N^b for a given symmetry level.
+    
+    Args:
+        run_dir: Direct path to run directory.
+        model: Model name.
+        basis: Basis name ('npa', 'heisenberg_simple', etc.).
+        npa_level: NPA level (only used when basis='npa').
+        boundary: Boundary condition.
+        results_root: Root results directory.
+        sym_level: Symmetry level to fit.
+        fit_N_min: Minimum N for fit.
+        fit_N_max: Maximum N for fit (None = all available).
+        time_column: Which time column to use.
+    
+    Returns:
+        Dict with fit parameters: 'a', 'b', 'r2', 'N_range', 'times', 'fitted'.
+    """
+    result = load_symmetry_benchmark(
+        run_dir, model=model, basis=basis, npa_level=npa_level, boundary=boundary, results_root=results_root
+    )
+    data = result["data"]
+    
+    mask = data["sym_level"] == sym_level
+    N_vals = data["N"][mask]
+    times = data[time_column][mask]
+    
+    sort_idx = np.argsort(N_vals)
+    N_vals = N_vals[sort_idx]
+    times = times[sort_idx]
+    
+    # Filter by N range
+    fit_mask = N_vals >= fit_N_min
+    if fit_N_max is not None:
+        fit_mask &= N_vals <= fit_N_max
+    
+    N_fit = N_vals[fit_mask]
+    t_fit = times[fit_mask]
+    
+    if len(N_fit) < 2:
+        raise ValueError(f"Need at least 2 points for fitting, got {len(N_fit)}")
+    
+    # Log-log fit: log(t) = log(a) + b*log(N)
+    log_N = np.log(N_fit)
+    log_t = np.log(t_fit)
+    
+    coeffs = np.polyfit(log_N, log_t, 1)
+    b = coeffs[0]
+    a = np.exp(coeffs[1])
+    
+    # R² in log space
+    log_t_pred = coeffs[0] * log_N + coeffs[1]
+    ss_res = np.sum((log_t - log_t_pred) ** 2)
+    ss_tot = np.sum((log_t - np.mean(log_t)) ** 2)
+    r2 = 1 - ss_res / ss_tot if ss_tot > 0 else 0
+    
+    return {
+        "a": a,
+        "b": b,
+        "r2": r2,
+        "sym_level": sym_level,
+        "N_range": (int(N_fit.min()), int(N_fit.max())),
+        "N_fit": N_fit,
+        "t_fit": t_fit,
+        "fitted": a * (N_fit ** b),
+    }
+
+
+def plot_symmetry_forecast(
+    run_dir: Optional[Path] = None,
+    *,
+    model: str = "heisenberg",
+    basis: str = "npa",
+    npa_level: Optional[int] = 2,
+    boundary: str = "periodic",
+    results_root: Optional[Path] = None,
+    sym_level: int = 6,
+    fit_N_min: int = 4,
+    fit_N_max: Optional[int] = None,
+    forecast_to_N: int = 50,
+    time_column: str = "t_best",
+    show: bool = True,
+    save_path: Optional[Path] = None,
+) -> Dict[str, Any]:
+    """Plot timing data with power-law fit and forecast.
+    
+    Args:
+        run_dir: Direct path to run directory.
+        model: Model name.
+        basis: Basis name ('npa', 'heisenberg_simple', etc.).
+        npa_level: NPA level (only used when basis='npa').
+        boundary: Boundary condition.
+        results_root: Root results directory.
+        sym_level: Symmetry level to plot/fit.
+        fit_N_min: Minimum N for fit.
+        fit_N_max: Maximum N for fit.
+        forecast_to_N: N value to forecast to.
+        time_column: Which time column to use.
+        show: Whether to call plt.show().
+        save_path: Optional path to save figure.
+    
+    Returns:
+        Dict with figure, axes, fit info, and forecast data.
+    """
+    result = load_symmetry_benchmark(
+        run_dir, model=model, basis=basis, npa_level=npa_level, boundary=boundary, results_root=results_root
+    )
+    data = result["data"]
+    
+    fit_info = fit_symmetry_scaling(
+        run_dir, model=model, basis=basis, npa_level=npa_level, boundary=boundary,
+        results_root=results_root, sym_level=sym_level,
+        fit_N_min=fit_N_min, fit_N_max=fit_N_max, time_column=time_column,
+    )
+    
+    mask = data["sym_level"] == sym_level
+    N_vals = data["N"][mask]
+    times = data[time_column][mask]
+    
+    sort_idx = np.argsort(N_vals)
+    N_vals = N_vals[sort_idx]
+    times = times[sort_idx]
+    
+    fig, ax = plt.subplots(figsize=(10, 6))
+    
+    # Plot data points
+    ax.scatter(N_vals, times, s=60, c='blue', alpha=0.7, label='Measured', zorder=3)
+    
+    # Plot fit line
+    N_line = np.linspace(fit_N_min, max(N_vals.max(), forecast_to_N), 100)
+    t_line = fit_info["a"] * (N_line ** fit_info["b"])
+    
+    N_max_data = N_vals.max()
+    
+    # Solid line for fitted region
+    ax.plot(N_line[N_line <= N_max_data], t_line[N_line <= N_max_data],
+            'k-', linewidth=2, label='Power-law fit')
+    
+    # Dashed line for forecast
+    if forecast_to_N > N_max_data:
+        ax.plot(N_line[N_line >= N_max_data], t_line[N_line >= N_max_data],
+                'k--', linewidth=2, label=f'Forecast to N={forecast_to_N}')
+    
+    # Add equation text
+    eq_text = f"t = {fit_info['a']:.3g} · N^{fit_info['b']:.3g}\nR² = {fit_info['r2']:.3f}"
+    ax.text(0.02, 0.98, eq_text, transform=ax.transAxes, va='top', ha='left',
+            fontsize=11, bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+    
+    ax.set_xlabel('System Size (N)', fontsize=12)
+    ax.set_ylabel('Solve Time (seconds)', fontsize=12)
+    basis_desc = f"NPA level {npa_level}" if basis == "npa" else basis.replace("_", " ").title()
+    ax.set_title(f'{model.capitalize()} SDP Scaling ({basis_desc}, {SYM_LEVEL_NAMES[sym_level]})', fontsize=14)
+    ax.set_yscale('log')
+    ax.grid(True, which="both", ls="-", alpha=0.4)
+    ax.legend(loc='upper left', fontsize=10)
+    
+    plt.tight_layout()
+    
+    if save_path is not None:
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    if show:
+        plt.show()
+    
+    # Generate forecast table
+    forecast_Ns = list(range(int(N_vals.min()), forecast_to_N + 1, 5))
+    forecast_times = [fit_info["a"] * (N ** fit_info["b"]) for N in forecast_Ns]
+    
+    return {
+        "fit_info": fit_info,
+        "figure": fig,
+        "axes": ax,
+        "forecast_Ns": forecast_Ns,
+        "forecast_times": forecast_times,
+    }
+
+
+def print_symmetry_forecast_table(
+    fit_info: Dict[str, Any],
+    N_values: List[int],
+) -> None:
+    """Print a table of forecasted runtimes.
+    
+    Args:
+        fit_info: Output from fit_symmetry_scaling().
+        N_values: List of N values to forecast.
+    """
+    a, b = fit_info["a"], fit_info["b"]
+    
+    print(f"Forecast equation: t = {a:.4g} · N^{b:.4g}")
+    print(f"\n{'N':<5} {'Time (s)':<12} {'Minutes':<12} {'Hours':<12} {'Days':<12}")
+    print("-" * 55)
+    
+    for N in N_values:
+        t = a * (N ** b)
+        mins = t / 60
+        hours = mins / 60
+        days = hours / 24
+        print(f"{N:<5} {t:<12.3e} {mins:<12.3e} {hours:<12.3e} {days:<12.3e}")
+
+
+def fit_time_vs_n_vars(
+    run_dir: Optional[Path] = None,
+    *,
+    model: str = "heisenberg",
+    basis: str = "npa",
+    npa_level: Optional[int] = 2,
+    boundary: str = "periodic",
+    results_root: Optional[Path] = None,
+    sym_level: int = 6,
+    fit_L_min: Optional[int] = None,
+    fit_L_max: Optional[int] = None,
+    time_column: str = "t_best",
+) -> Dict[str, Any]:
+    """Fit a power-law scaling t = a * L^b where L is the number of SDP variables (n_vars).
+    
+    This is useful for estimating runtime based on basis size, which can be computed
+    without actually running the SDP.
+    
+    Args:
+        run_dir: Direct path to run directory.
+        model: Model name.
+        basis: Basis name ('npa', 'heisenberg_simple', etc.).
+        npa_level: NPA level (only used when basis='npa').
+        boundary: Boundary condition.
+        results_root: Root results directory.
+        sym_level: Symmetry level to fit.
+        fit_L_min: Minimum n_vars for fit.
+        fit_L_max: Maximum n_vars for fit (None = all available).
+        time_column: Which time column to use.
+    
+    Returns:
+        Dict with fit parameters: 'a', 'b', 'r2', 'L_range', 'L_fit', 't_fit', 'fitted'.
+    """
+    result = load_symmetry_benchmark(
+        run_dir, model=model, basis=basis, npa_level=npa_level, boundary=boundary, results_root=results_root
+    )
+    data = result["data"]
+    
+    mask = data["sym_level"] == sym_level
+    n_vars = data["n_vars"][mask]
+    times = data[time_column][mask]
+    
+    sort_idx = np.argsort(n_vars)
+    n_vars = n_vars[sort_idx]
+    times = times[sort_idx]
+    
+    # Filter by L range
+    fit_mask = np.ones_like(n_vars, dtype=bool)
+    if fit_L_min is not None:
+        fit_mask &= n_vars >= fit_L_min
+    if fit_L_max is not None:
+        fit_mask &= n_vars <= fit_L_max
+    
+    L_fit = n_vars[fit_mask]
+    t_fit = times[fit_mask]
+    
+    if len(L_fit) < 2:
+        raise ValueError(f"Need at least 2 points for fitting, got {len(L_fit)}")
+    
+    # Power-law fit: t = a * L^b => log(t) = log(a) + b*log(L)
+    mask_pos = (L_fit > 0) & (t_fit > 0)
+    log_L = np.log(L_fit[mask_pos])
+    log_t = np.log(t_fit[mask_pos])
+    
+    coeffs = np.polyfit(log_L, log_t, 1)
+    b = coeffs[0]
+    a = np.exp(coeffs[1])
+    
+    # R² in log-log space
+    log_t_pred = coeffs[0] * log_L + coeffs[1]
+    ss_res = np.sum((log_t - log_t_pred) ** 2)
+    ss_tot = np.sum((log_t - np.mean(log_t)) ** 2)
+    r2 = 1 - ss_res / ss_tot if ss_tot > 0 else 0
+    
+    return {
+        "a": float(a),
+        "b": float(b),
+        "r2": float(r2),
+        "sym_level": sym_level,
+        "L_range": (int(L_fit.min()), int(L_fit.max())),
+        "L_fit": L_fit,
+        "t_fit": t_fit,
+        "fitted": a * (L_fit ** b),
+        "equation": f"t = {a:.4g} · L^{b:.4g}",
+    }
+
+
+def plot_time_vs_n_vars_with_forecast(
+    run_dir: Optional[Path] = None,
+    *,
+    model: str = "heisenberg",
+    basis: str = "npa",
+    npa_level: Optional[int] = 2,
+    boundary: str = "periodic",
+    results_root: Optional[Path] = None,
+    sym_level: int = 6,
+    fit_L_min: Optional[int] = None,
+    fit_L_max: Optional[int] = None,
+    forecast_to_L: Optional[int] = None,
+    time_column: str = "t_best",
+    show: bool = True,
+    save_path: Optional[Path] = None,
+) -> Dict[str, Any]:
+    """Plot SDP solve time vs n_vars (number of SDP variables) with power-law fit and forecast.
+    
+    Similar to plot_total_time_vs_basis_size_combined_Ns_with_forecast but for symmetry benchmarks,
+    using n_vars (reduced variable count after symmetry) as the x-axis.
+    
+    Args:
+        run_dir: Direct path to run directory.
+        model: Model name.
+        basis: Basis name ('npa', 'heisenberg_simple', etc.).
+        npa_level: NPA level (only used when basis='npa').
+        boundary: Boundary condition.
+        results_root: Root results directory.
+        sym_level: Symmetry level to plot/fit.
+        fit_L_min: Minimum n_vars for fit.
+        fit_L_max: Maximum n_vars for fit.
+        forecast_to_L: L value to forecast to.
+        time_column: Which time column to use.
+        show: Whether to call plt.show().
+        save_path: Optional path to save figure.
+    
+    Returns:
+        Dict with figure, axes, fit info, and forecast data.
+    """
+    result = load_symmetry_benchmark(
+        run_dir, model=model, basis=basis, npa_level=npa_level, boundary=boundary, results_root=results_root
+    )
+    data = result["data"]
+    meta = result["meta"]
+    
+    mask = data["sym_level"] == sym_level
+    n_vars = data["n_vars"][mask]
+    times = data[time_column][mask]
+    N_vals = data["N"][mask]
+    
+    sort_idx = np.argsort(n_vars)
+    n_vars = n_vars[sort_idx]
+    times = times[sort_idx]
+    N_vals = N_vals[sort_idx]
+    
+    # Get fit
+    fit_info = fit_time_vs_n_vars(
+        run_dir, model=model, basis=basis, npa_level=npa_level, boundary=boundary,
+        results_root=results_root, sym_level=sym_level,
+        fit_L_min=fit_L_min, fit_L_max=fit_L_max, time_column=time_column,
+    )
+    
+    fig, ax = plt.subplots(figsize=(10, 6))
+    
+    # Plot data points with N labels
+    scatter = ax.scatter(n_vars, times, s=60, c='blue', alpha=0.7, label='Measured', zorder=3)
+    
+    # Annotate points with N values
+    for i, (x, y, N) in enumerate(zip(n_vars, times, N_vals)):
+        ax.annotate(f'N={N}', (x, y), textcoords="offset points", xytext=(5, 5), fontsize=8, alpha=0.7)
+    
+    # Plot fit line
+    L_max_data = n_vars.max()
+    L_min_data = n_vars.min()
+    L_max_plot = max(L_max_data, forecast_to_L or L_max_data)
+    
+    L_line = np.linspace(L_min_data, L_max_plot, 200)
+    t_line = fit_info["a"] * (L_line ** fit_info["b"])
+    
+    # Solid line for fitted region
+    ax.plot(L_line[L_line <= L_max_data], t_line[L_line <= L_max_data],
+            'k-', linewidth=2, label='Power-law fit')
+    
+    # Dashed line for forecast
+    if forecast_to_L is not None and forecast_to_L > L_max_data:
+        ax.plot(L_line[L_line >= L_max_data], t_line[L_line >= L_max_data],
+                'k--', linewidth=2, label=f'Forecast to L={forecast_to_L}')
+    
+    # Add equation text
+    eq_text = f"t = {fit_info['a']:.3g} · L^{fit_info['b']:.3g}\nR² = {fit_info['r2']:.3f}"
+    ax.text(0.02, 0.98, eq_text, transform=ax.transAxes, va='top', ha='left',
+            fontsize=11, bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+    
+    ax.set_xlabel('Number of SDP Variables (L = n_vars)', fontsize=12)
+    ax.set_ylabel('Solve Time (seconds)', fontsize=12)
+    basis_desc = f"NPA level {npa_level}" if basis == "npa" else basis.replace("_", " ").title()
+    ax.set_title(f'{model.capitalize()} SDP: Time vs n_vars ({basis_desc}, {SYM_LEVEL_NAMES[sym_level]})', fontsize=14)
+    ax.set_xscale('log')
+    ax.set_yscale('log')
+    ax.grid(True, which="both", ls="-", alpha=0.4)
+    ax.legend(loc='upper left', fontsize=10)
+    
+    plt.tight_layout()
+    
+    if save_path is not None:
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    if show:
+        plt.show()
+    
+    return {
+        "meta": meta,
+        "fit_info": fit_info,
+        "figure": fig,
+        "axes": ax,
+        "n_vars": n_vars,
+        "times": times,
+        "N_vals": N_vals,
+    }
+
+
+def print_time_vs_n_vars_forecast_table(
+    fit_info: Dict[str, Any],
+    L_values: List[int],
+) -> None:
+    """Print a table of forecasted runtimes based on n_vars (L).
+    
+    Args:
+        fit_info: Output from fit_time_vs_n_vars().
+        L_values: List of n_vars values to forecast.
+    """
+    a, b = fit_info["a"], fit_info["b"]
+    
+    print(f"Forecast equation: t = {a:.4g} · L^{b:.4g}")
+    print(f"Where L = n_vars (number of SDP variables after symmetry reduction)")
+    print(f"\n{'L (n_vars)':<12} {'Time (s)':<12} {'Minutes':<12} {'Hours':<12} {'Days':<12}")
+    print("-" * 60)
+    
+    for L in L_values:
+        t = a * (L ** b)
+        mins = t / 60
+        hours = mins / 60
+        days = hours / 24
+        print(f"{L:<12} {t:<12.3e} {mins:<12.3e} {hours:<12.3e} {days:<12.3e}")

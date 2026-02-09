@@ -5,7 +5,8 @@ This is a *rough* estimator based on a fitted single-SDP solve-time model:
 
     t_sdp(L) = a * L^b
 
-where L is the SDP basis size (number of monomials / basis words).
+where L is the SDP basis size (number of monomials / basis words), OR the
+number of independent SDP variables after symmetry reduction.
 
 We only estimate experiments that run SDPs:
   - full_relaxation (one SDP per N)
@@ -19,11 +20,13 @@ Usage:
   python3 -m spins_sdp.run.estimate_runtime --config spins_sdp/run/experiments_config.json
   python3 -m spins_sdp.run.estimate_runtime --test
   python3 -m spins_sdp.run.estimate_runtime --dry-run  # prints counts + equations only
+  python3 -m spins_sdp.run.estimate_runtime --from-artifact  # load fit from symmetry benchmark
 
 Notes:
 - The default (a, b) comes from the power law benchmark fit in benchmark.ipynb.
 - Extrapolating beyond the fit window may be very wrong.
 - The fit is based on my ICFO computer: 12th gen i5-12500, 16GB RAM
+- Use --from-artifact to load fit from the latest symmetry benchmark (recommended).
 """
 
 from __future__ import annotations
@@ -68,9 +71,53 @@ class FitModel:
     b: float = 3.85611475429724
     fit_L_min: int = 20
     fit_L_max: int = 200
+    use_n_vars: bool = False  # if True, L is n_vars (after symmetry), else basis_size
 
     def t_sdp_seconds(self, basis_size: int) -> float:
         return float(self.a) * float(basis_size) ** float(self.b)
+
+
+def load_fit_from_symmetry_benchmark(
+    *,
+    model: str = "heisenberg",
+    basis: str = "heisenberg_simple",
+    npa_level: int | None = None,
+    boundary: str = "periodic",
+    sym_level: int = 6,
+    results_root: Path | None = None,
+) -> FitModel | None:
+    """Try to load fit parameters from a symmetry benchmark artifact.
+    
+    Returns FitModel if found, None otherwise.
+    """
+    try:
+        # Import here to avoid circular imports
+        from plots import fit_time_vs_n_vars, find_symmetry_benchmark
+        
+        if results_root is None:
+            results_root = Path(__file__).resolve().parents[1] / "results"
+        
+        run_dir = find_symmetry_benchmark(
+            model=model, basis=basis, npa_level=npa_level, boundary=boundary, results_root=results_root
+        )
+        if run_dir is None:
+            return None
+        
+        fit_info = fit_time_vs_n_vars(
+            run_dir, model=model, basis=basis, npa_level=npa_level, boundary=boundary,
+            sym_level=sym_level,
+        )
+        
+        L_min, L_max = fit_info["L_range"]
+        return FitModel(
+            a=fit_info["a"],
+            b=fit_info["b"],
+            fit_L_min=L_min,
+            fit_L_max=L_max,
+            use_n_vars=True,
+        )
+    except Exception:
+        return None
 
 
 def _human_time(seconds: float) -> str:
@@ -103,6 +150,36 @@ def pick_mode_block(config: Dict[str, Any], *, test: bool) -> Dict[str, Any]:
 # Basis-size estimators
 # -----------------------------------------------------------------------------
 
+def _get_symmetry_manager(N: int, global_cfg: Dict[str, Any]):
+    """Create a SymmetryManager from global config symmetry settings."""
+    try:
+        from spins_sdp.symmetry import SymmetryManager
+        
+        sym_cfg = global_cfg.get("symmetry", {})
+        return SymmetryManager(
+            N=N,
+            use_rotation=sym_cfg.get("use_rotation", False),
+            use_sign_symmetry=sym_cfg.get("use_sign_symmetry", False),
+            use_translation=sym_cfg.get("use_translation", False),
+            use_mirror=sym_cfg.get("use_mirror", False),
+            use_permutation=sym_cfg.get("use_permutation", False),
+            use_real_operator=sym_cfg.get("use_real_operator", False),
+        )
+    except ImportError:
+        return None
+
+
+def count_n_vars(basis: List[Any], sym_manager) -> int:
+    """Count the number of independent SDP variables after symmetry reduction."""
+    try:
+        from spins_sdp.sdp import build_block_reps
+        _, global_index = build_block_reps(basis, sym_manager)
+        return len(set(global_index.values()))
+    except ImportError:
+        # Fallback: return basis size
+        return len(basis)
+
+
 def basis_size_for_relaxation(*, basis: str, N: int, npa_level: int | None) -> int:
     """Return basis size used by npa_energy_lb for the given config."""
     # Map user-friendly names -> actual basis builder behavior.
@@ -118,6 +195,30 @@ def basis_size_for_relaxation(*, basis: str, N: int, npa_level: int | None) -> i
         return len(generate_npa_basis(N=N, k=int(npa_level)).words)
 
     raise ValueError(f"Unknown relaxation basis '{basis}'. Use 'heisenberg_simple' or 'npa'.")
+
+
+def get_basis_for_relaxation(*, basis: str, N: int, npa_level: int | None) -> List[Any]:
+    """Return the actual basis (list of PauliWords) for the given config."""
+    basis_norm = str(basis).strip().lower()
+
+    if basis_norm == "heisenberg_simple":
+        return generate_heisenberg_paper_basis(N=N)
+
+    if basis_norm == "npa":
+        if npa_level is None:
+            raise ValueError("basis='npa' requires npa_level in config")
+        return generate_npa_basis(N=N, k=int(npa_level)).words
+
+    raise ValueError(f"Unknown relaxation basis '{basis}'. Use 'heisenberg_simple' or 'npa'.")
+
+
+def n_vars_for_relaxation(*, basis: str, N: int, npa_level: int | None, global_cfg: Dict[str, Any]) -> int:
+    """Return n_vars (after symmetry reduction) for the given config."""
+    basis_list = get_basis_for_relaxation(basis=basis, N=N, npa_level=npa_level)
+    sym_manager = _get_symmetry_manager(N, global_cfg)
+    if sym_manager is None:
+        return len(basis_list)
+    return count_n_vars(basis_list, sym_manager)
 
 
 def build_npa_basis_sets(N: int, start_level: int, end_level: int) -> Tuple[List[Any], List[Any], List[Any]]:
@@ -189,7 +290,7 @@ class Estimate:
     notes: str = ""
 
 
-def estimate_full_relaxation(block: Dict[str, Any], fit: FitModel) -> Estimate | None:
+def estimate_full_relaxation(block: Dict[str, Any], global_cfg: Dict[str, Any], fit: FitModel) -> Estimate | None:
     cfg = block.get("full_relaxation", {})
     if not cfg.get("enabled", False):
         return None
@@ -202,14 +303,19 @@ def estimate_full_relaxation(block: Dict[str, Any], fit: FitModel) -> Estimate |
     out_of_fit = 0
 
     for N in Ns:
-        L = basis_size_for_relaxation(basis=basis, N=int(N), npa_level=npa_level)
+        if fit.use_n_vars:
+            # Use n_vars (after symmetry reduction)
+            L = n_vars_for_relaxation(basis=basis, N=int(N), npa_level=npa_level, global_cfg=global_cfg)
+        else:
+            L = basis_size_for_relaxation(basis=basis, N=int(N), npa_level=npa_level)
         if L < fit.fit_L_min or L > fit.fit_L_max:
             out_of_fit += 1
         total += fit.t_sdp_seconds(L)
 
+    l_type = "n_vars" if fit.use_n_vars else "basis sizes"
     notes = ""
     if out_of_fit:
-        notes = f"{out_of_fit}/{len(Ns)} basis sizes outside fit window [{fit.fit_L_min},{fit.fit_L_max}]"
+        notes = f"{out_of_fit}/{len(Ns)} {l_type} outside fit window [{fit.fit_L_min},{fit.fit_L_max}]"
 
     return Estimate(
         name="full_relaxation",
@@ -219,7 +325,7 @@ def estimate_full_relaxation(block: Dict[str, Any], fit: FitModel) -> Estimate |
     )
 
 
-def estimate_optimization(block: Dict[str, Any], fit: FitModel) -> Estimate | None:
+def estimate_optimization(block: Dict[str, Any], global_cfg: Dict[str, Any], fit: FitModel) -> Estimate | None:
     cfg = block.get("optimization", {})
     if not cfg.get("enabled", False):
         return None
@@ -242,6 +348,9 @@ def estimate_optimization(block: Dict[str, Any], fit: FitModel) -> Estimate | No
     total_sdps_wall = 0
     out_of_fit = 0
     total_basis_calls = 0
+    
+    # Get symmetry manager if using n_vars mode
+    sym_manager_cache: Dict[int, Any] = {}
 
     for N in Ns:
         starting_set, adding_set, _final = build_npa_basis_sets(N=int(N), start_level=start_level, end_level=end_level)
@@ -254,6 +363,10 @@ def estimate_optimization(block: Dict[str, Any], fit: FitModel) -> Estimate | No
         if k_min > k_max_eff:
             continue
         k_values = list(range(k_min, k_max_eff + 1, k_step))
+        
+        # Get symmetry manager for this N if using n_vars mode
+        if fit.use_n_vars and N not in sym_manager_cache:
+            sym_manager_cache[N] = _get_symmetry_manager(int(N), global_cfg)
 
         for method_name, method_cfg in methods.items():
             if not method_cfg.get("enabled", False):
@@ -284,9 +397,22 @@ def estimate_optimization(block: Dict[str, Any], fit: FitModel) -> Estimate | No
 
             for k in k_values:
                 basis_size = starting_size + int(k)
-                t_one_eval = fit.t_sdp_seconds(basis_size)
+                
+                # Determine L: use n_vars if fit.use_n_vars, else basis_size
+                if fit.use_n_vars:
+                    sym_manager = sym_manager_cache.get(N)
+                    if sym_manager is not None:
+                        # Build the actual basis at this k
+                        current_basis = starting_set + adding_set[:int(k)]
+                        L = count_n_vars(current_basis, sym_manager)
+                    else:
+                        L = basis_size
+                else:
+                    L = basis_size
+                
+                t_one_eval = fit.t_sdp_seconds(L)
 
-                if basis_size < fit.fit_L_min or basis_size > fit.fit_L_max:
+                if L < fit.fit_L_min or L > fit.fit_L_max:
                     out_of_fit += 1
                 total_basis_calls += 1
 
@@ -299,9 +425,10 @@ def estimate_optimization(block: Dict[str, Any], fit: FitModel) -> Estimate | No
                 total_sdps_wall += n_sdps_this_k_wall
                 total_seconds_wall += n_sdps_this_k_wall * t_one_eval
 
+    l_type = "n_vars" if fit.use_n_vars else "basis sizes"
     notes = ""
     if total_basis_calls and out_of_fit:
-        notes = f"{out_of_fit}/{total_basis_calls} basis sizes outside fit window [{fit.fit_L_min},{fit.fit_L_max}]"
+        notes = f"{out_of_fit}/{total_basis_calls} {l_type} outside fit window [{fit.fit_L_min},{fit.fit_L_max}]"
 
     return Estimate(
         name="optimization",
@@ -324,31 +451,87 @@ def main() -> int:
     p.add_argument("--test", action="store_true", help="Estimate test_mode instead of experiments")
     p.add_argument("--dry-run", action="store_true", help="Only print counts and equations")
 
-    p.add_argument("--a", type=float, default=FitModel.a, help="Fit constant a in t=a*L^b")
-    p.add_argument("--b", type=float, default=FitModel.b, help="Fit exponent b in t=a*L^b")
-    p.add_argument("--fit-L-min", type=int, default=FitModel.fit_L_min, help="Fit window min L")
-    p.add_argument("--fit-L-max", type=int, default=FitModel.fit_L_max, help="Fit window max L")
+    p.add_argument("--a", type=float, default=None, help="Fit constant a in t=a*L^b (overrides --from-artifact)")
+    p.add_argument("--b", type=float, default=None, help="Fit exponent b in t=a*L^b (overrides --from-artifact)")
+    p.add_argument("--fit-L-min", type=int, default=None, help="Fit window min L")
+    p.add_argument("--fit-L-max", type=int, default=None, help="Fit window max L")
+    
+    p.add_argument(
+        "--from-artifact", 
+        action="store_true", 
+        help="Load fit from symmetry benchmark artifact (uses n_vars after symmetry reduction)"
+    )
+    p.add_argument(
+        "--artifact-basis", 
+        type=str, 
+        default="heisenberg_simple",
+        help="Basis for artifact lookup (default: heisenberg_simple)"
+    )
+    p.add_argument(
+        "--artifact-sym-level", 
+        type=int, 
+        default=6,
+        help="Symmetry level for artifact lookup (default: 6 = all symmetries)"
+    )
 
     args = p.parse_args()
 
     config = load_config(args.config)
+    global_cfg = config.get("global_settings", {})
     block = pick_mode_block(config, test=args.test)
 
-    fit = FitModel(a=args.a, b=args.b, fit_L_min=args.fit_L_min, fit_L_max=args.fit_L_max)
+    # Determine fit model
+    fit = None
+    fit_source = "default"
+    
+    if args.from_artifact:
+        # Try to load from symmetry benchmark artifact
+        model = global_cfg.get("model", "heisenberg")
+        basis = args.artifact_basis
+        boundary = "periodic"  # symmetry benchmark uses periodic
+        sym_level = args.artifact_sym_level
+        
+        fit = load_fit_from_symmetry_benchmark(
+            model=model, basis=basis, boundary=boundary, sym_level=sym_level
+        )
+        if fit is not None:
+            fit_source = f"symmetry benchmark (basis={basis}, sym_level={sym_level})"
+        else:
+            print("Warning: Could not load fit from artifact, using defaults.")
+    
+    if fit is None:
+        # Use default or manual overrides
+        a = args.a if args.a is not None else FitModel.a
+        b = args.b if args.b is not None else FitModel.b
+        fit_L_min = args.fit_L_min if args.fit_L_min is not None else FitModel.fit_L_min
+        fit_L_max = args.fit_L_max if args.fit_L_max is not None else FitModel.fit_L_max
+        fit = FitModel(a=a, b=b, fit_L_min=fit_L_min, fit_L_max=fit_L_max)
+    
+    # Apply any manual overrides
+    if args.a is not None or args.b is not None or args.fit_L_min is not None or args.fit_L_max is not None:
+        fit = FitModel(
+            a=args.a if args.a is not None else fit.a,
+            b=args.b if args.b is not None else fit.b,
+            fit_L_min=args.fit_L_min if args.fit_L_min is not None else fit.fit_L_min,
+            fit_L_max=args.fit_L_max if args.fit_L_max is not None else fit.fit_L_max,
+            use_n_vars=fit.use_n_vars,
+        )
 
     mode_name = "TEST" if args.test else "FULL"
     print("=" * 72)
     print(f"SpinsSDP SDP Runtime Estimate ({mode_name} mode)")
     print("=" * 72)
-    print(f"Fit: t(L) = {fit.a:.4g} * L^{fit.b:.4g}   (fit window L∈[{fit.fit_L_min},{fit.fit_L_max}])")
+    l_var_name = "n_vars" if fit.use_n_vars else "L (basis size)"
+    print(f"Fit source: {fit_source}")
+    print(f"Fit: t({l_var_name}) = {fit.a:.4g} * {l_var_name}^{fit.b:.4g}   (window [{fit.fit_L_min},{fit.fit_L_max}])")
 
     estimates: List[Estimate] = []
 
-    e_relax = estimate_full_relaxation(block, fit)
+    e_relax = estimate_full_relaxation(block, global_cfg, fit)
     if e_relax:
         estimates.append(e_relax)
 
-    e_opt = estimate_optimization(block, fit)
+    e_opt = estimate_optimization(block, global_cfg, fit)
     if e_opt:
         estimates.append(e_opt)
 

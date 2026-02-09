@@ -125,18 +125,14 @@ def build_block_reps(full_basis: List[PauliWord], symmetry_manager: SymmetryMana
     else:
         blocks["all"] = list(full_basis)
     
-    # Collect Global Labels from ALL pairs in the FULL basis
-    # This ensures that products that canonicalize across blocks are included
+    # Collect Global Labels
+    # We collect PAIRS: (original_u, canonical_u)
     raw_to_canonical = {}
     canonical_set = {PauliWord(0,0)}
     
     # Always map Identity to Identity
     raw_to_canonical[PauliWord(0,0)] = PauliWord(0,0)
 
-    # Iterate over ALL pairs in the full basis (not just within-block pairs)
-    # This is necessary because moment matrix entries M[i,j] = <w_i^dag w_j>
-    # come from pairs within each block, but their canonical forms must all
-    # be present in the global index.
     for sig, block_basis in blocks.items():
         for i, w1 in enumerate(block_basis):
             for w2 in block_basis[i:]:

@@ -24,7 +24,7 @@ def _require_pandas():
         ) from e
     return pd
 
-from spins_sdp.bell_algebra import generate_npa_basis
+from spins_sdp.basis_builder import generate_npa_basis
 from spins_sdp.pauli import Operator, PauliWord
 from spins_sdp.models import ising_hamiltonian_exact, ising_hamiltonian_dict
 from spins_sdp.sdp import solve_pauli_relaxation

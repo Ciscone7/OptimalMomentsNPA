@@ -297,7 +297,7 @@ class RBMTrainer:
         if initial_guess is not None
         else random_v0(subkey, N = self.N, k = self.hamming_weight)
         )
-        self.current_cost = self.obj_func(self.v0)
+        self.current_cost = float(self.obj_func(self.v0))
         self.current_vec = self.v0
 
 
@@ -324,15 +324,13 @@ class RBMTrainer:
             Binary vector of length equal to N, with exactly
             `hamming_weight` ones.
         """
-        new_cost = self.obj_func(new_vec)
+        new_cost = float(self.obj_func(new_vec))
 
         if new_cost < self.current_cost:
             self.current_cost = new_cost
             self.current_vec = new_vec
             
         return new_cost
-
-
 
     def train_step(self) -> None:
         """

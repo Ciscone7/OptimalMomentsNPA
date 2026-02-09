@@ -864,6 +864,7 @@ def _get_full_relaxation_lower_bound_from_artifact(
     end_level: int,
     solver: str,
     mosek_tol: float,
+    symmetry: Optional[Dict[str, bool]] = None,
     results_root: Optional[Path] = None,
 ) -> float:
     """Load the SDP lower bound for the full relaxation (k=end_level) from artifacts.
@@ -882,11 +883,13 @@ def _get_full_relaxation_lower_bound_from_artifact(
         "npa_level": int(end_level),
         "method": "pauli_moment_relaxation",
         "sense": "min",
-        "solver": str(solver),
         "mosek_tol": float(mosek_tol),
     }
     if model_params:
         meta_query["params"] = {k: float(v) for k, v in model_params.items()}
+    if symmetry:
+        # Match the symmetry-reduced relaxation (important for fair comparison).
+        meta_query["symmetry"] = {k: bool(v) for k, v in symmetry.items()}
 
     try:
         run_dir = _find_run_dir(
@@ -898,8 +901,20 @@ def _get_full_relaxation_lower_bound_from_artifact(
         data = _load_npz(run_dir)
         N_arr = np.asarray(data["N"], dtype=int)
         E_lb = np.asarray(data["E_lb"], dtype=float)
+        basis_size_arr = np.asarray(data.get("basis_size", []), dtype=int)
         idx = np.where(N_arr == int(N))[0]
         if len(idx) > 0:
+            # Staleness check: verify the stored basis_size matches the current code
+            if len(basis_size_arr) > idx[0]:
+                stored_bs = int(basis_size_arr[idx[0]])
+                expected_bs = len(generate_npa_basis(N=int(N), k=int(end_level)).words)
+                if stored_bs != expected_bs:
+                    print(
+                        f"[WARN] Stale artifact detected for N={N}: "
+                        f"stored basis_size={stored_bs} vs expected={expected_bs}. "
+                        f"Regenerate with --force. Returning NaN."
+                    )
+                    return float("nan")
             return float(E_lb[idx[0]])
     except FileNotFoundError:
         pass
@@ -1302,6 +1317,7 @@ def plot_optimization_convergence(
                 end_level=end_level,
                 solver=str(meta.get("solver", "MOSEK")),
                 mosek_tol=float(meta.get("mosek_tol", 1e-9)),
+                symmetry=meta.get("symmetry"),
                 results_root=results_root,
             )
             if np.isfinite(float(full_relaxation_energy)):
@@ -1310,6 +1326,25 @@ def plot_optimization_convergence(
             else:
                 full_relaxation_energy = None
                 full_relaxation_source = "missing"
+
+    # Sanity check: full relaxation should never be WORSE than any subset.
+    # If we got it from an external artifact and it's below the best observed value,
+    # that artifact is likely stale or mismatched (e.g. computed with different code/config).
+    if (
+        full_relaxation_energy is not None
+        and full_relaxation_source == "artifact"
+        and float(full_relaxation_energy) < float(np.max(best_vals)) - 1e-8
+    ):
+        print(
+            "[WARN] Full-relaxation reference appears inconsistent with this optimization run. "
+            "Using the best observed value as the reference for plotting. "
+            f"artifact_full={float(full_relaxation_energy):.12g} best_observed={float(np.max(best_vals)):.12g}. "
+            "If you need the true k=L value, rerun the moment-relaxation artifact with the same settings "
+            "or pass full_relaxation_energy explicitly."
+        )
+        full_relaxation_energy = float(np.max(best_vals))
+        full_relaxation_label = "Best observed (max k in run)"
+        full_relaxation_source = "best_observed"
     
     # Starting energy (k=0)
     starting_energy = best_per_k.get(0, best_vals[0])
@@ -2381,7 +2416,7 @@ def plot_method_comparison(
     
     # Find all available methods if not specified
     if methods is None:
-        methods = ["sa", "pt", "bo", "random"]
+        methods = ["sa", "pt", "bo", "rbm", "random"]
     
     method_data = {}
     
@@ -2454,6 +2489,7 @@ def plot_method_comparison(
         "sa": "C0",
         "pt": "C1",
         "bo": "C2",
+        "rbm": "C4",
     }
     
     # --- Plotting ---

@@ -5,7 +5,12 @@ from typing import Any, Dict, Iterable, List, Tuple
 import argparse
 
 from spins_sdp import models
-from spins_sdp.basis_builder import generate_npa_basis
+from spins_sdp.basis_builder import (
+    generate_npa_basis,
+    generate_heisenberg_paper_basis,
+    generate_heisenberg_j2_basis_weak,
+    generate_heisenberg_j2_basis_strong,
+)
 from spins_sdp.symmetry import SymmetryManager
 
 
@@ -91,6 +96,56 @@ def build_npa_basis_sets(
     # Final set is just all words
     final_set = full_basis.words
     
+    return starting_set, adding_set, final_set
+
+
+# Mapping from CLI name to generator function (no extra args beyond N).
+_NAMED_BASIS_GENERATORS = {
+    "heisenberg_simple": generate_heisenberg_paper_basis,
+    "heisenberg_j2_weak": generate_heisenberg_j2_basis_weak,
+    "heisenberg_j2_strong": generate_heisenberg_j2_basis_strong,
+}
+
+
+def build_basis_sets(
+    N: int,
+    start_level: int,
+    end_basis: str = "npa",
+    end_level: int = 2,
+):
+    """Return (starting_set, adding_set, final_set) for an optimization sweep.
+
+    Parameters
+    ----------
+    N : int
+        Number of spin sites.
+    start_level : int
+        NPA level for the starting (fixed) set.
+    end_basis : str
+        Either ``"npa"`` (use ``end_level``) or a named basis like
+        ``"heisenberg_simple"``, ``"heisenberg_j2_weak"``, etc.
+    end_level : int
+        NPA level for the final set (only used when ``end_basis="npa"``).
+    """
+    # Build the starting set from NPA levels 0..start_level
+    start_npa = generate_npa_basis(N=N, k=start_level)
+    starting_set = list(start_npa.words)  # all words up to start_level
+
+    if end_basis == "npa":
+        return build_npa_basis_sets(N=N, start_level=start_level, end_level=end_level)
+
+    # Named basis: generate the full word list, subtract the starting set.
+    gen = _NAMED_BASIS_GENERATORS.get(end_basis)
+    if gen is None:
+        raise ValueError(
+            f"Unknown end_basis={end_basis!r}. "
+            f"Choose from: npa, {', '.join(sorted(_NAMED_BASIS_GENERATORS))}"
+        )
+    final_set = gen(N=N)
+
+    starting_words = set(starting_set)
+    adding_set = [w for w in final_set if w not in starting_words]
+
     return starting_set, adding_set, final_set
 
 

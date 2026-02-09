@@ -1,6 +1,7 @@
 import numpy as np
 import random
 import multiprocessing as mp
+from functools import lru_cache
 from tqdm import tqdm
 
 from typing import List, Dict, Optional, Any, Callable, Union
@@ -77,6 +78,16 @@ def simulated_annealing(
         np.random.seed(seed)
         random.seed(seed)
 
+    # Objective cache: avoids redundant SDP solves on revisited states.
+    @lru_cache(maxsize=None)
+    def _cached_eval(key: tuple) -> float:
+        if obj_uses_indices:
+            return obj_func(list(key))
+        m = np.zeros(N, dtype=int)
+        if key:
+            m[list(key)] = 1
+        return obj_func(m)
+
     # --- Initialization Phase ---
     if initial_guess is not None:
         guess = np.asarray(initial_guess, dtype=int)
@@ -137,11 +148,8 @@ def simulated_annealing(
     # Track selected indices for efficient swapping (avoid O(N) scans)
     selected_indices = set(sel_indices)
     
-    # Initial evaluation
-    if obj_uses_indices:
-        current_cost = obj_func(sorted(selected_indices))
-    else:
-        current_cost = obj_func(selection)
+    # Initial evaluation (cached)
+    current_cost = _cached_eval(tuple(sorted(selected_indices)))
     
     best_selection = selection.copy()
     best_cost = current_cost
@@ -177,11 +185,8 @@ def simulated_annealing(
             selected_indices.remove(out_idx)
             selected_indices.add(in_idx)
 
-            # Evaluate
-            if obj_uses_indices:
-                new_cost = obj_func(sorted(selected_indices))
-            else:
-                new_cost = obj_func(selection)
+            # Evaluate (cached)
+            new_cost = _cached_eval(tuple(sorted(selected_indices)))
 
             # Acceptance Criterion
             delta = new_cost - current_cost
@@ -268,7 +273,7 @@ def parallel_tempering(
     """
     if num_chains is None:
         num_chains = mp.cpu_count()
-
+    
     # Seed only the manager RNG; each worker gets its own deterministic seed below
     if seed is not None:
         np.random.seed(seed)

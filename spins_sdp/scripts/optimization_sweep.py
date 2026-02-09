@@ -1,7 +1,8 @@
 """Run optimization sweeps for moment selection and save results.
 
 This script finds optimal subsets of monomials to add to a starting basis,
-using simulated annealing, parallel tempering, Bayesian optimization
+using simulated annealing, parallel tempering, Bayesian optimization, or RBM-based
+REINFORCE optimization.
 
 The random sampling method (`--method random`) provides a baseline for comparison:
 it randomly selects k monomials without any optimization.
@@ -59,6 +60,7 @@ from spins_sdp.scripts._artifact_io import (
 )
 from spins_sdp.scripts._common import (
     add_symmetry_args,
+    build_basis_sets,
     build_npa_basis_sets,
     hamiltonian_dict_fn,
     model_params_from_args,
@@ -334,7 +336,7 @@ def run_single_optimization(
         n_obj_evals = method_params.get("steps", 100) + 1  # +1 for initial eval
         
     elif method == "pt":
-        pt_num_chains = method_params.get("num_chains", 4)
+        pt_num_chains = method_params.get("num_chains", None)
 
         result = parallel_tempering(
             obj_func=obj_func,
@@ -387,10 +389,53 @@ def run_single_optimization(
             previous_best=None,
             seed=seed,
             verbose=False,
+            obj_uses_indices=True,
         )
 
         # BO evaluates the objective once per initial sample and once per iteration
         n_obj_evals = n_init + n_iter
+
+    elif method == "rbm":
+        # RBM-based REINFORCE optimization
+        try:
+            from src.optimalsdp.rbm import RBMTrainer
+        except ImportError as e:
+            raise ImportError(
+                "RBM optimization requires JAX, Equinox, and Optax. "
+                "Install with `pip install jax equinox optax` "
+                "(or `pip install -r requirements-dev.txt`), or use --method sa/pt/bo/random."
+            ) from e
+
+        import jax.numpy as jnp
+
+        rbm_steps = int(method_params.get("steps", 100))
+
+        # Wrap obj_func so that JAX arrays are converted to NumPy before
+        # reaching OptimizationObjective (which uses isinstance(mask, np.ndarray)).
+        _raw_obj = obj_func
+        def _numpy_obj(v):
+            return _raw_obj(np.asarray(v))
+
+        trainer = RBMTrainer(
+            obj_func=_numpy_obj,
+            N=L,
+            hamming_weight=k,
+            steps=rbm_steps,
+            seed=seed if seed is not None else 42,
+        )
+        trainer.train(num_steps=rbm_steps, verbose=False)
+
+        best_mask = np.asarray(trainer.current_vec, dtype=np.int32)
+        best_loss = float(trainer.current_cost)
+        best_lb = -best_loss
+        elapsed = time.perf_counter() - t0
+
+        return {
+            "best_value": best_lb,
+            "mask": best_mask,
+            "elapsed_s": elapsed,
+            "n_obj_evals": rbm_steps + 1,  # +1 for initial eval
+        }
 
     elif method == "random":
         # Random sampling baseline: just pick k random positions and evaluate once.
@@ -453,6 +498,7 @@ def compute_and_save(
     boundary: str,
     start_level: int,
     end_level: int,
+    end_basis: str = "npa",
     method: str,
     method_params: Dict[str, Any],
     k_values: List[int],
@@ -487,11 +533,13 @@ def compute_and_save(
     Returns:
         Path to the run directory.
     """
-    starting_set, adding_set, final_set = build_npa_basis_sets(N=N, start_level=start_level, end_level=end_level)
+    starting_set, adding_set, final_set = build_basis_sets(
+        N=N, start_level=start_level, end_basis=end_basis, end_level=end_level,
+    )
     L = len(adding_set)
     
     if verbose:
-        print(f"Model: {model_name}, N={N}, boundary={boundary}")
+        print(f"Model: {model_name}, N={N}, boundary={boundary}, end_basis={end_basis}")
         print(f"Starting set size: {len(starting_set)}, Adding set size: {L}, Final set size: {len(final_set)}")
 
     # Create fingerprint for adding_set (avoid slow stringification for large L)
@@ -507,6 +555,7 @@ def compute_and_save(
         "boundary": boundary,
         "start_level": int(start_level),
         "end_level": int(end_level),
+        "end_basis": end_basis,
         "starting_set_size": len(starting_set),
         "adding_set_size": L,
         "adding_set_hash": adding_set_hash,
@@ -786,14 +835,21 @@ def main(argv: Optional[List[str]] = None) -> int:
     
     # Basis parameters
     p.add_argument("--start-level", type=int, default=1, help="NPA level for starting set")
-    p.add_argument("--end-level", type=int, default=2, help="NPA level for final set")
+    p.add_argument("--end-level", type=int, default=2, help="NPA level for final set (only used when --end-basis=npa)")
+    p.add_argument(
+        "--end-basis",
+        type=str,
+        default="npa",
+        choices=["npa", "heisenberg_simple", "heisenberg_j2_weak", "heisenberg_j2_strong"],
+        help="Basis type for the final (full) set. 'npa' uses --end-level; others use named generators.",
+    )
     
     # Optimization method
     p.add_argument(
         "--method",
-        choices=["sa", "pt", "bo", "random"],
+        choices=["sa", "pt", "bo", "rbm", "random"],
         default="sa",
-        help="sa=simulated annealing, pt=parallel tempering, bo=bayesian optimization, random=random sampling baseline",
+        help="sa=simulated annealing, pt=parallel tempering, bo=bayesian optimization, rbm=RBM REINFORCE, random=random sampling baseline",
     )
     
     # SA parameters
@@ -823,7 +879,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         default=100,
         help="BO: number of candidate masks scored by the surrogate per iteration",
     )
-    
+
+    # RBM parameters
+    p.add_argument("--rbm-steps", type=int, default=100, help="RBM: number of REINFORCE training steps")
+
     # Sweep parameters
     k_group = p.add_mutually_exclusive_group(required=True)
     k_group.add_argument("--ks", nargs="+", type=int, help="Explicit list of k values")
@@ -888,6 +947,10 @@ def main(argv: Optional[List[str]] = None) -> int:
             "n_iter": args.bo_n_iter,
             "candidates_per_iter": args.bo_candidates_per_iter,
         }
+    elif args.method == "rbm":
+        method_params = {
+            "steps": args.rbm_steps,
+        }
     else:
         # random method has no hyperparameters
         method_params = {}
@@ -902,6 +965,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         boundary=args.boundary,
         start_level=args.start_level,
         end_level=args.end_level,
+        end_basis=args.end_basis,
         method=args.method,
         method_params=method_params,
         k_values=k_values,

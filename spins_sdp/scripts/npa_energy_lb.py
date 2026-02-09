@@ -48,12 +48,15 @@ from spins_sdp.scripts._artifact_io import (
     utc_now_iso,
 )
 from spins_sdp.scripts._common import (
+    add_symmetry_args,
     hamiltonian_dict_fn,
     model_params_from_args,
     parse_ns_from_args,
+    symmetry_config_from_args,
     time_best_avg,
 )
 from spins_sdp.sdp import solve_pauli_relaxation
+from spins_sdp.symmetry import SymmetryManager
 
 
 SCHEMA_VERSION = 1
@@ -99,26 +102,14 @@ def compute_and_save(
     model_params: Dict[str, float],
     basis_name: str,
     boundary: str,
-    solver: str,
+    symmetry_config: Dict[str, bool],
     mosek_tol: float,
-    solver_opts_json: Optional[str],
     repeats: int,
     out_root: Path,
     resume: bool,
     force: bool,
     verbose: bool,
 ) -> Path:
-    # Allow passing solver opts as a JSON string from CLI.
-    solver_opts: Optional[Dict[str, Any]] = None
-    if solver_opts_json:
-        try:
-            parsed = json.loads(solver_opts_json)
-        except json.JSONDecodeError as e:
-            raise SystemExit(f"--solver-opts-json must be valid JSON: {e}")
-        if not isinstance(parsed, dict):
-            raise SystemExit("--solver-opts-json must decode to a JSON object (dict)")
-        solver_opts = parsed
-
     config: Dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
         "artifact": ARTIFACT_NAME,
@@ -129,10 +120,9 @@ def compute_and_save(
         "basis": basis_name,
         "npa_level": int(npa_level) if basis_name == "npa" else None,
         "sense": "min",
-        "solver": solver,
         "mosek_tol": float(mosek_tol),
-        "solver_opts": solver_opts or None,
         "repeats": int(repeats),
+        "symmetry": symmetry_config,
     }
 
     if basis_name != "npa":
@@ -173,15 +163,15 @@ def compute_and_save(
             pbar.set_postfix({"N": int(N), "done": len(existing), "total": len(requested)})
             basis = _basis_words(basis_name=basis_name, N=N, level=npa_level, boundary=boundary)
             operator = H_dict_fn(N=N, boundary=boundary, **model_params)
+            sym_manager = SymmetryManager(N=N, **symmetry_config)
 
             def run_one() -> float:
                 return solve_pauli_relaxation(
                     basis,
                     operator,
+                    symmetry_manager=sym_manager,
                     sense="min",
-                    solver=solver,
                     mosek_tol=mosek_tol,
-                    solver_opts=solver_opts,
                     verbose=verbose,
                 )
 
@@ -238,14 +228,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--J2", type=float, default=0.0)
     p.add_argument("--boundary", choices=["open", "periodic"], default="open")
 
-    p.add_argument("--solver", type=str, default="MOSEK")
     p.add_argument("--mosek-tol", type=float, default=1e-9)
-    p.add_argument(
-        "--solver-opts-json",
-        type=str,
-        default=None,
-        help="Optional JSON dict to pass through as solver_opts (merged on top of defaults in solve_pauli_relaxation)",
-    )
+
+    add_symmetry_args(p)
 
     p.add_argument("--repeats", type=int, default=1)
     p.add_argument("--verbose", action="store_true")
@@ -262,8 +247,8 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     args = p.parse_args(argv)
     Ns = parse_ns_from_args(args)
-
     model_params = model_params_from_args(args)
+    symmetry_config = symmetry_config_from_args(args)
 
     out_dir = compute_and_save(
         Ns=Ns,
@@ -272,9 +257,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         model_params=model_params,
         basis_name=args.basis,
         boundary=args.boundary,
-        solver=args.solver,
+        symmetry_config=symmetry_config,
         mosek_tol=args.mosek_tol,
-        solver_opts_json=args.solver_opts_json,
         repeats=args.repeats,
         out_root=args.out_root,
         resume=args.resume,

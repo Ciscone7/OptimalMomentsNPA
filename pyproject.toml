@@ -13,16 +13,17 @@ dependencies = [
     "mosek>=10.0",
     "numpy>=2.0",
     "scipy>=1.13",
-    "pandas>=2.0",
     "qutip>=4.7",
     "physics-tenpy>=0.9",
     "tqdm>=4.60",
     "numpyencoder",
     "pillow>=9.0",
-    "matplotlib>=3.5",
 ]
 
 [project.optional-dependencies]
+# Plotting / analysis helpers (used by plots.py and benchmarking notebooks)
+plotting = ["matplotlib>=3.5", "pandas>=2.0"]
+
 # Bayesian optimization with random forests
 bayesian = ["scikit-learn>=1.0"]
 
@@ -36,7 +37,14 @@ hdf5 = ["h5py>=3.0"]
 all = ["scikit-learn>=1.0", "jax>=0.4", "equinox>=0.11", "optax>=0.1", "h5py>=3.0"]
 
 # Development dependencies (for local development only)
-dev = ["black>=23.0", "ipython>=8.0", "ipykernel>=6.0", "jupyterlab>=4.0"]
+dev = [
+    "black>=23.0",
+    "ipython>=8.0",
+    "ipykernel>=6.0",
+    "jupyterlab>=4.0",
+    "matplotlib>=3.5",
+    "pandas>=2.0",
+]
 
 [tool.setuptools.packages.find]
 where = ["."]

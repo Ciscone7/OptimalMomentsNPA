@@ -2,10 +2,17 @@
     "global_settings": {
         "model":"heisenberg",
         "model_params": {},
-        "solver": "MOSEK",
         "resume": true,
         "verbose": true,
-        "results_dir": "spins_sdp/results"
+        "results_dir": "spins_sdp/results",
+        "symmetry": {
+            "use_rotation": true,
+            "use_sign_symmetry": true,
+            "use_translation": true,
+            "use_mirror": true,
+            "use_permutation": true,
+            "use_real_operator": true
+        }
     },
 
     "test_mode": {
@@ -27,7 +34,7 @@
 
         "full_relaxation": {
             "enabled": true,
-            "Ns": [6],
+            "Ns": [10],
             "basis": "heisenberg_simple"
         },
 
@@ -35,12 +42,12 @@
             "enabled": true,
             "start_level": "1",
             "end_level": "4",
-            "Ns": [6],
+            "Ns": [10],
             "k_min": 0,
             "k_max": 200,
             "k_step": 20,
             "methods": {
-                "random": {"enabled": true, "num_seeds": 5},
+                "random": {"enabled": true, "num_seeds": 10},
                 "sa": {"enabled": false, "steps": 10, "num_seeds": 2},
                 "pt": {"enabled": true, "chains": null, "epochs": 0, "steps_per_epoch": 40, "num_seeds": 1, "T_min": 0.1, "T_max": 2.0},
                 "bo": {"enabled": false, "n_init": 10, "n_iter": 10, "candidates_per_iter": 10, "num_seeds": 2}
@@ -77,14 +84,14 @@
             "enabled": true,
             "start_level": "1",
             "end_level": "4",
-            "Ns": [6],
+            "Ns": [10],
             "k_min": 0,
             "k_max": 802,
             "k_step": 40,
             "methods": {
                 "random": {"enabled": true, "num_seeds": 5},
                 "sa": {"enabled": false, "steps": 100, "num_seeds": 10},
-                "pt": {"enabled": true, "chains": null, "epochs": 0, "steps_per_epoch": 40, "num_seeds": 1, "T_min": 0.1, "T_max": 2.0},
+                "pt": {"enabled": true, "chains": null, "epochs": 5, "steps_per_epoch": 40, "num_seeds": 1, "T_min": 0.1, "T_max": 2.0},
                 "bo": {"enabled": false, "n_init": 10, "n_iter": 30, "candidates_per_iter": 50, "num_seeds": 10}
             }
         }

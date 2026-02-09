@@ -6,6 +6,7 @@ import argparse
 
 from spins_sdp import models
 from spins_sdp.basis_builder import generate_npa_basis
+from spins_sdp.symmetry import SymmetryManager
 
 
 def time_best_avg(fn, repeats: int) -> Tuple[Any, float, float]:
@@ -91,3 +92,48 @@ def build_npa_basis_sets(
     final_set = full_basis.words
     
     return starting_set, adding_set, final_set
+
+
+def add_symmetry_args(parser: argparse.ArgumentParser) -> None:
+    """Add symmetry-related CLI arguments to a parser."""
+    sym_group = parser.add_argument_group("symmetry options")
+    sym_group.add_argument("--use-rotation", action="store_true", default=False,
+                          help="Block diagonalize by signature")
+    sym_group.add_argument("--use-sign-symmetry", action="store_true", default=False,
+                          help="Zero out variant moments")
+    sym_group.add_argument("--use-translation", action="store_true", default=False,
+                          help="Group by translation orbits")
+    sym_group.add_argument("--use-mirror", action="store_true", default=False,
+                          help="Group by spatial reflection")
+    sym_group.add_argument("--use-permutation", action="store_true", default=False,
+                          help="Group by X/Y/Z relabeling")
+    sym_group.add_argument("--use-real-operator", action="store_true", default=False,
+                          help="Restrict to real-valued moments")
+    sym_group.add_argument("--use-all-symmetries", action="store_true", default=False,
+                          help="Enable all symmetries (shortcut)")
+
+
+def symmetry_config_from_args(args: argparse.Namespace) -> Dict[str, bool]:
+    """Extract symmetry configuration from parsed args (excludes N)."""
+    if getattr(args, "use_all_symmetries", False):
+        return {
+            "use_rotation": True,
+            "use_sign_symmetry": True,
+            "use_translation": True,
+            "use_mirror": True,
+            "use_permutation": True,
+            "use_real_operator": True,
+        }
+    return {
+        "use_rotation": getattr(args, "use_rotation", False),
+        "use_sign_symmetry": getattr(args, "use_sign_symmetry", False),
+        "use_translation": getattr(args, "use_translation", False),
+        "use_mirror": getattr(args, "use_mirror", False),
+        "use_permutation": getattr(args, "use_permutation", False),
+        "use_real_operator": getattr(args, "use_real_operator", False),
+    }
+
+
+def make_symmetry_manager(N: int, symmetry_config: Dict[str, bool]) -> SymmetryManager:
+    """Create a SymmetryManager from N and a symmetry config dict."""
+    return SymmetryManager(N=N, **symmetry_config)

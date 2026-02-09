@@ -20,6 +20,25 @@ def _safe_int(value, default: int) -> int:
     return int(value)
 
 
+def _build_symmetry_args(global_cfg: dict) -> list[str]:
+    """Build CLI args for symmetry options from global config."""
+    sym_cfg = global_cfg.get("symmetry", {})
+    args = []
+    if sym_cfg.get("use_rotation"):
+        args.append("--use-rotation")
+    if sym_cfg.get("use_sign_symmetry"):
+        args.append("--use-sign-symmetry")
+    if sym_cfg.get("use_translation"):
+        args.append("--use-translation")
+    if sym_cfg.get("use_mirror"):
+        args.append("--use-mirror")
+    if sym_cfg.get("use_permutation"):
+        args.append("--use-permutation")
+    if sym_cfg.get("use_real_operator"):
+        args.append("--use-real-operator")
+    return args
+
+
 def _compute_ks(cfg: dict, *, adding_size: int | None) -> list[int]:
     """Compute the list of k values to sweep.
 
@@ -114,12 +133,14 @@ def run_relaxation(cfg: dict, global_cfg: dict, dry_run: bool) -> None:
         "--basis", basis,
         "--Ns", *[str(n) for n in Ns],
         "--boundary", "periodic",
-        "--solver", global_cfg["solver"],
     ]
     if npa_level:
         cmd.extend(["--npa-level", str(npa_level)])
     if global_cfg.get("resume"):
         cmd.append("--resume")
+    
+    # Add symmetry args
+    cmd.extend(_build_symmetry_args(global_cfg))
     
     run(cmd, dry_run)
 
@@ -205,6 +226,9 @@ def run_optimization(cfg: dict, global_cfg: dict, dry_run: bool) -> None:
                 cmd.append("--resume")
             if global_cfg.get("verbose"):
                 cmd.append("--verbose")
+            
+            # Add symmetry args
+            cmd.extend(_build_symmetry_args(global_cfg))
             
             run(cmd, dry_run)
 

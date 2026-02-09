@@ -55,18 +55,42 @@ class PauliWord:
         
         return (s_xy, s_yz)
     
-    def is_variant_under_sign_symmetries(self) -> bool:
+    def shift(self, k: int, N: int) -> PauliWord:
         """
-        Returns True if the expectation value <u> must be zero due to 
-        Hamiltonian sign symmetries (Appendix B.2.b).
-        
-        Theory: <u> != 0 only if Nx, Ny, and Nz are ALL even numbers.
+        Cyclic shift of the Pauli word by k sites on a chain of length N.
+        Effectively maps site i -> (i + k) % N.
         """
-        nx = (self.x_mask & ~self.z_mask).bit_count()
-        ny = (self.x_mask & self.z_mask).bit_count()
-        nz = (~self.x_mask & self.z_mask).bit_count()
+        if k == 0:
+            return self
+            
+        k = k % N
+        if k == 0: # Check again after modulo
+            return self
+
+        # We need to rotate the bits within the window of size N.
+        # Mask to ensure we don't pick up garbage bits above N
+        mask_N = (1 << N) - 1
         
-        return (nx % 2 != 0) or (ny % 2 != 0) or (nz % 2 != 0)
+        # Rotation logic: (Left Shift) | (Wrap Around)
+        # Note: (x >> (N - k)) handles the wrap-around bits moving to the start
+        new_x = ((self.x_mask << k) & mask_N) | (self.x_mask >> (N - k))
+        new_z = ((self.z_mask << k) & mask_N) | (self.z_mask >> (N - k))
+        
+        return PauliWord(new_x, new_z)
+    
+    def reflect(self, N: int) -> 'PauliWord':
+        """Spatial reflection site i -> N - 1 - i."""
+        def reverse_bits(n: int, bits: int) -> int:
+            result = 0
+            for i in range(bits):
+                if (n >> i) & 1:
+                    result |= (1 << (bits - 1 - i))
+            return result
+            
+        return PauliWord(
+            reverse_bits(self.x_mask, N),
+            reverse_bits(self.z_mask, N)
+        )
     
     def __repr__(self) -> str:
         """
@@ -94,6 +118,21 @@ class PauliWord:
                 parts.append(f"Z{i}")
         
         return "".join(parts) if parts else "I"
+
+
+def is_variant_under_sign_symmetries(w: PauliWord) -> bool:
+    """
+    Returns True if the expectation value <u> must be zero due to 
+    Hamiltonian sign symmetries.
+    
+    Theory: <u> != 0 only if Nx, Ny, and Nz are ALL even numbers.
+    """
+    nx = (w.x_mask & ~w.z_mask).bit_count()
+    ny = (w.x_mask & w.z_mask).bit_count()
+    nz = (~w.x_mask & w.z_mask).bit_count()
+    
+    return (nx % 2 != 0) or (ny % 2 != 0) or (nz % 2 != 0)
+
 
 @dataclass(frozen=True, slots=True)
 class PauliTerm:
@@ -204,271 +243,118 @@ def local_pauli(site: int, axis: Axis) -> PauliWord:
     return PauliWord(bit, bit)
 
 
-
 def compile_moment_matrix_rep(
-        basis: List[PauliWord],
-        precomputed_label_index: Optional[Dict[PauliWord, int]] = None
-    ) -> PauliMomentMatrixRep:
+    basis: List[PauliWord],
+    manager: "SymmetryManager",
+    precomputed_label_index: Optional[Dict[PauliWord, int]] = None
+) -> PauliMomentMatrixRep:
     """
-    Given basis monomials W=[w_i], build the compiled representation of the moment matrix:
-      M_ij = <w_i^† w_j> = (known phase) * <u_ij>
-    Since (reduced) Pauli words are Hermitian, w_i^† = w_i.
+    Compiles the moment matrix representation M_ij = <w_i^dag w_j>
+    respecting all active symmetries in the manager.
 
-    Output contains:
-      - the set of required moment labels u (canonical Pauli words),
-      - and for each (i,j) the label index plus the re/im phase coefficient.
-        M_{ij} = (A_{ij} + iB_{ij}) y_{u_{ij}}
-    
-    If precomputed_label_index is provided, it forces the representation to use 
-    these specific indices for moments.
+    Features:
+    - Zeroes out variant moments (Sign Symmetry).
+    - Maps moments to canonical variables (Translation/Mirror/Permutation).
+    - Drops imaginary part B if use_real_operator is True.
     """
     n = len(basis)
-    if n == 0:
-        raise ValueError("Basis must be non-empty.")
-
-    I = I_PAULI
-
-    if precomputed_label_index is None:
-        # Auto-discover labels
-        label_set: set[PauliWord] = {I}
-        for i in range(n):
-            wi = basis[i]
-            for j in range(i, n):
-                wj = basis[j]
-                _, u = multiply_words(wi, wj)
-                label_set.add(u)
-        
-        labels_rest = sorted(
-            (u for u in label_set if u != I),
-            key=lambda u: (u.support_size(), u.x_mask, u.z_mask),
-        )
-        labels = [I] + labels_rest
-        label_index = {u: k for k, u in enumerate(labels)}
-    else:
-        # Use the provided registry
-        label_index = precomputed_label_index
-        # Reconstruct the list 'labels' from the dict for the dataclass
-        labels = [None] * len(label_index)
-        for u, idx in label_index.items():
-            labels[idx] = u
-    # --- LOGIC BRANCHING END ---
+    # The empty label I is always index 0
+    I = PauliWord(0, 0)
     
-    idx_I = label_index[I]
-
-    # Allocate compiled arrays
-    label_idx = np.empty((n, n), dtype=np.int32)
-    A = np.empty((n, n), dtype=np.int8)
-    B = np.empty((n, n), dtype=np.int8)
-
-    # Second pass: fill upper triangle, mirror using Hermitian structure
-    for i in range(n):
-        wi = basis[i]
-        for j in range(i, n):
-            wj = basis[j]
-            p, u = multiply_words(wi, wj)
-            
-            re = _PHASE_RE[p]
-            im = _PHASE_IM[p]
-            
-            k = label_index[u]
-
-            label_idx[i, j] = k
-            A[i, j] = re
-            B[i, j] = im
-
-            # Hermitian completion: M_ji = conj(M_ij)
-            label_idx[j, i] = k
-            A[j, i] = re
-            B[j, i] = -im
-
-    return PauliMomentMatrixRep(
-        basis=basis,
-        labels=labels,
-        label_index=label_index,
-        label_idx=label_idx,
-        a_coef=A,
-        b_coef=B,
-        idx_I=idx_I,
-    )
-
-
-def compile_moment_matrix_rep3(
-        basis: List[PauliWord],
-        precomputed_label_index: Optional[Dict[PauliWord, int]] = None
-    ) -> PauliMomentMatrixRep:
-    """
-    Given basis monomials W=[w_i], build the compiled representation of the moment matrix:
-      M_ij = <w_i^† w_j> = (known phase) * <u_ij>
-    Since (reduced) Pauli words are Hermitian, w_i^† = w_i.
-
-    Output contains:
-      - the set of required moment labels u (canonical Pauli words),
-      - and for each (i,j) the label index plus the re/im phase coefficient.
-        M_{ij} = (A_{ij} + iB_{ij}) y_{u_{ij}}
+    # Discover Variables (Pass 1)
+    # If indices aren't provided, we must find all unique canonical variables
+    label_index = precomputed_label_index
     
-    If precomputed_label_index is provided, it forces the representation to use 
-    these specific indices for moments.
-    """
-    n = len(basis)
-    if n == 0:
-        raise ValueError("Basis must be non-empty.")
-
-    I = I_PAULI
-
-    if precomputed_label_index is None:
-        # Auto-discover labels
-        label_set: set[PauliWord] = {I}
+    if label_index is None:
+        label_set = {I}
         for i in range(n):
             wi = basis[i]
             for j in range(i, n):
                 wj = basis[j]
                 _, u = multiply_words(wi, wj)
                 
-                if not u.is_variant_under_sign_symmetries():
-                    label_set.add(u)
+                # Ask Manager for the canonical form
+                # If it returns None, it's a structural zero.
+                c = manager.canonicalize(u)
+                if c is not None:
+                    label_set.add(c)
         
-        labels_rest = sorted(
-            (u for u in label_set if u != I),
-            key=lambda u: (u.support_size(), u.x_mask, u.z_mask),
-        )
-        labels = [I] + labels_rest
-        label_index = {u: k for k, u in enumerate(labels)}
+        # Sort for deterministic index
+        sorted_labels = sorted(list(label_set), key=lambda x: (x.support_size(), x.x_mask, x.z_mask))
+        # Ensure I is 0
+        if sorted_labels[0] != I:
+            sorted_labels.remove(I)
+            sorted_labels.insert(0, I)
+        label_index = {l: k for k, l in enumerate(sorted_labels)}
     else:
-        # Use the provided registry
-        label_index = precomputed_label_index
-        # Reconstruct the list 'labels' from the dict for the dataclass
-        labels = [None] * len(label_index)
-        for u, idx in label_index.items():
-            labels[idx] = u
-    # --- LOGIC BRANCHING END ---
-    
+        # Reconstruct sorted_labels from the map
+        sorted_labels = [None] * len(label_index)
+        for w, idx in label_index.items():
+            sorted_labels[idx] = w
+
     idx_I = label_index[I]
+    
+    # Allocate Arrays
+    # A = Real part, B = Imaginary part
+    # If use_real_operator is True, we don't allocate B
+    
+    label_idx = np.zeros((n, n), dtype=np.int32)
+    A = np.zeros((n, n), dtype=np.float64)
+    
+    if manager.use_real_operator:
+        B = np.zeros((0, 0), dtype=np.float64)
+    else:
+        B = np.zeros((n, n), dtype=np.float64)
 
-    # Allocate compiled arrays
-    label_idx = np.empty((n, n), dtype=np.int32)
-    A = np.empty((n, n), dtype=np.int8)
-    B = None  # All zeros, not needed
-
-    # Second pass: fill upper triangle, mirror using Hermitian structure
+    # Fill Matrix (Pass 2)
     for i in range(n):
         wi = basis[i]
-        for j in range(i, n):
+        
+        # Diagonal element (i,i)
+        # wi^dag wi = I.  This is always real (1.0).
+        label_idx[i, i] = idx_I
+        A[i, i] = 1.0
+        # B[i,i] remains 0
+        
+        for j in range(i + 1, n):
             wj = basis[j]
             p, u = multiply_words(wi, wj)
             
-            # Handle variant moments (STRUCTURAL ZEROS)
-            if u.is_variant_under_sign_symmetries():
-                # Hardcode entry to 0. Point index to I as a dummy.
-                # The coefficient 0 ensures the variable is effectively unused here.
-                label_idx[i, j] = idx_I 
-                A[i, j] = 0
-                
-                # Hermitian mirror
+            # Canonicalize
+            c = manager.canonicalize(u)
+            
+            if c is None:
+                # Structural Zero (killed by symmetry)
+                label_idx[i, j] = idx_I
                 label_idx[j, i] = idx_I
-                A[j, i] = 0
-                continue  # Skip the rest of the loop
+                # A, B remain 0
+                continue
+                
+            # If valid, look up index
+            k = label_index[c]
             
+            # Phase factors
             re = _PHASE_RE[p]
-            im = _PHASE_IM[p]
             
-            k = label_index[u]
-
             label_idx[i, j] = k
-            A[i, j] = re
-
-            # Hermitian completion: M_ji = conj(M_ij)
             label_idx[j, i] = k
-            A[j, i] = re
+            
+            # Fill A (Real part)
+            A[i, j] = re
+            A[j, i] = re  # A is Symmetric
+            
+            # Fill B (Imaginary part) - ONLY if needed
+            if not manager.use_real_operator:
+                im = _PHASE_IM[p]
+                B[i, j] = im
+                B[j, i] = -im # B is Anti-Symmetric
 
     return PauliMomentMatrixRep(
         basis=basis,
-        labels=labels,
+        labels=sorted_labels,
         label_index=label_index,
         label_idx=label_idx,
         a_coef=A,
         b_coef=B,
         idx_I=idx_I,
     )
-
-
-
-
-
-def apply_permutation(w: PauliWord, p: Tuple[int, int, int]) -> PauliWord:
-    """
-    Apply a permutation p of axes (0,1,2) corresponding to (X,Y,Z).
-    p=(1,2,0) means: Old X->Y, Old Y->Z, Old Z->X.
-    """
-    # 1. Extract local operators
-    # We rebuild the masks from scratch
-    new_x_mask = 0
-    new_z_mask = 0
-    
-    # Iterate over all sites that have something
-    combined_mask = w.x_mask | w.z_mask
-    
-    if combined_mask == 0:
-        return w # Identity is invariant
-        
-    length = combined_mask.bit_length()
-    
-    for i in range(length):
-        bit = 1 << i
-        has_x = (w.x_mask & bit) != 0
-        has_z = (w.z_mask & bit) != 0
-        
-        if not (has_x or has_z):
-            continue
-            
-        # Determine current type: 0=X, 1=Y, 2=Z
-        # Based on: X(1,0), Z(0,1), Y(1,1)
-        if has_x and has_z:
-            current_type = 1 # Y
-        elif has_x:
-            current_type = 0 # X
-        else:
-            current_type = 2 # Z
-            
-        # Map to new type
-        new_type = p[current_type]
-        
-        # Write to new masks
-        # Map: 0->(1,0), 1->(1,1), 2->(0,1)
-        if new_type == 0: # X
-            new_x_mask |= bit
-        elif new_type == 1: # Y
-            new_x_mask |= bit
-            new_z_mask |= bit
-        elif new_type == 2: # Z
-            new_z_mask |= bit
-            
-    return PauliWord(new_x_mask, new_z_mask)
-
-@lru_cache(maxsize=None)
-def canonicalize_word(w: PauliWord) -> PauliWord:
-    """
-    Return the lexicographically smallest PauliWord in the S3 orbit of w.
-    """
-    # The 6 permutations of (0, 1, 2)
-    perms = [
-        (0,1,2), (0,2,1),
-        (1,0,2), (1,2,0),
-        (2,0,1), (2,1,0)
-    ]
-    
-    # We want to minimize the tuple representation (support_size, x_mask, z_mask)
-    # This ensures a consistent canonical representative.
-    best = w
-    best_key = (w.support_size(), w.x_mask, w.z_mask)
-    
-    for p in perms[1:]: # Skip identity
-        cand = apply_permutation(w, p)
-        cand_key = (cand.support_size(), cand.x_mask, cand.z_mask)
-        if cand_key < best_key:
-            best = cand
-            best_key = cand_key
-            
-    return best
-
-
-

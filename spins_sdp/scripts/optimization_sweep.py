@@ -302,6 +302,7 @@ def run_single_optimization(
     seed: int,
     method: str,
     method_params: Dict[str, Any],
+    initial_guess: Optional[np.ndarray] = None,
 ) -> Dict[str, Any]:
     """Run a single optimization and return results.
     
@@ -312,6 +313,8 @@ def run_single_optimization(
         seed: Random seed.
         method: "sa", "pt", "bo", or "random".
         method_params: Method-specific parameters.
+        initial_guess: Optional mask from a previous k to warm-start from.
+            SA and BO use it directly; PT uses it to seed the coldest chain.
     
     Returns:
         Dict with keys: best_value, mask, elapsed_s, n_obj_evals
@@ -324,7 +327,7 @@ def run_single_optimization(
             obj_func=obj_func,
             N=L,
             k=k,
-            initial_guess=None,
+            initial_guess=initial_guess,
             steps=method_params.get("steps", 100),
             T_start=method_params.get("T_start", 2.0),
             alpha=method_params.get("alpha", 0.95),
@@ -347,6 +350,7 @@ def run_single_optimization(
             steps_per_epoch=method_params.get("steps_per_epoch", 50),
             T_min=method_params.get("T_min", 0.01),
             T_max=method_params.get("T_max", 2.0),
+            initial_guess=initial_guess,
             seed=seed,
             verbose=False,
             obj_uses_indices=True,
@@ -386,7 +390,7 @@ def run_single_optimization(
             n_init=n_init,
             n_iter=n_iter,
             candidates_per_iter=candidates_per_iter,
-            previous_best=None,
+            previous_best=initial_guess,
             seed=seed,
             verbose=False,
             obj_uses_indices=True,
@@ -509,6 +513,7 @@ def compute_and_save(
     resume: bool,
     force: bool,
     verbose: bool,
+    feedback: bool = False,
 ) -> Path:
     """Run optimization sweep and save results.
     
@@ -529,6 +534,8 @@ def compute_and_save(
         resume: If True, skip already-computed runs.
         force: If True, recompute even if present.
         verbose: Print progress.
+        feedback: If True, chain k-values per seed: the best mask found at
+            k_i is passed as initial_guess to k_{i+1}.
     
     Returns:
         Path to the run directory.
@@ -541,6 +548,8 @@ def compute_and_save(
     if verbose:
         print(f"Model: {model_name}, N={N}, boundary={boundary}, end_basis={end_basis}")
         print(f"Starting set size: {len(starting_set)}, Adding set size: {L}, Final set size: {len(final_set)}")
+        if feedback:
+            print("Feedback mode: ON (warm-start chaining across k values)")
 
     # Create fingerprint for adding_set (avoid slow stringification for large L)
     adding_set_hash = _stable_pauliword_mask_hash(adding_set, N=N)
@@ -563,6 +572,7 @@ def compute_and_save(
         "method_params": dict(sorted(method_params.items())),
         "symmetry": symmetry_config,
         "mosek_tol": float(mosek_tol),
+        "feedback": bool(feedback),
     }
     
     cfg_hash = config_hash(config)
@@ -579,20 +589,29 @@ def compute_and_save(
         completed, existing_arrays = _load_existing_runs(data_path) if resume else ({}, {})
     
     # Determine which (k, seed) pairs to compute
-    all_jobs = [(kv, s) for kv in k_values for s in seeds]
+    #
+    # When feedback=True the jobs for each seed MUST be processed in ascending k
+    # order so that the best mask at k_i can warm-start k_{i+1}.  Resuming a
+    # partially-completed feedback sweep is supported: we skip (k, seed) pairs
+    # already present, but we still need to replay the mask chain for the
+    # earlier k values.  We achieve this cheaply by loading the stored mask for
+    # already-completed points but not re-solving the SDP.
+
+    sorted_k_values = sorted(k_values)
+    all_jobs = [(kv, s) for kv in sorted_k_values for s in seeds]
     if force:
-        missing_jobs = all_jobs
+        missing_jobs_set: Set[Tuple[int, int]] = set(all_jobs)
     else:
-        missing_jobs = [(kv, s) for kv, s in all_jobs if (kv, s) not in completed]
+        missing_jobs_set = {(kv, s) for kv, s in all_jobs if (kv, s) not in completed}
     
     if verbose:
         print(
             f"Total jobs requested: {len(all_jobs)}, "
             f"Already in artifact: {len(completed)}, "
-            f"To compute now: {len(missing_jobs)}"
+            f"To compute now: {len(missing_jobs_set)}"
         )
     
-    if not missing_jobs:
+    if not missing_jobs_set:
         if verbose:
             print("All jobs already completed. Nothing to do.")
         return run_dir
@@ -631,7 +650,9 @@ def compute_and_save(
         next_run_idx = 0
     
     # Run missing jobs
-    pbar = tqdm(missing_jobs, desc="Optimization sweep", disable=not verbose)
+    n_computed = 0
+    total_to_compute = len(missing_jobs_set)
+    pbar = tqdm(total=total_to_compute, desc="Optimization sweep", disable=not verbose)
 
     # Build metadata template once; we'll update counters and timestamps as we go.
     meta: Dict[str, Any] = {
@@ -657,51 +678,107 @@ def compute_and_save(
     # even if interrupted. Data is checkpointed every completed run.
     upsert_meta_json(meta_path, meta)
 
+    # Helper: load a previously-computed mask from existing_arrays for feedback
+    # chaining (avoid re-solving the SDP).
+    def _load_existing_mask(kv: int, s: int) -> Optional[np.ndarray]:
+        """Return the stored mask for an already-completed (k, seed) pair."""
+        if not existing_arrays or "mask_bits" not in existing_arrays:
+            return None
+        run_idx_target = completed.get((kv, s))
+        if run_idx_target is None:
+            return None
+        # Find position of that run_idx in existing arrays
+        for pos, rid in enumerate(existing_arrays["run_idx"]):
+            if int(rid) == run_idx_target:
+                packed_row = existing_arrays["mask_bits"][pos]
+                if isinstance(packed_row, np.ndarray):
+                    return np.unpackbits(packed_row)[:L].astype(np.int32)
+                return None
+        return None
+
+    def _checkpoint() -> None:
+        """Atomically save all accumulated results to disk."""
+        if mask_bits_list:
+            mb = np.stack(mask_bits_list, axis=0)
+        else:
+            mb = np.array([], dtype=np.uint8).reshape(0, 0)
+        _save_runs(
+            data_path=data_path,
+            run_idx=run_idx_list,
+            k=k_list,
+            seed=seed_list,
+            best_value=best_value_list,
+            elapsed_s=elapsed_s_list,
+            n_obj_evals=n_obj_evals_list,
+            mask_bits=mb,
+        )
+
     try:
-        for kv, s in pbar:
-            pbar.set_postfix({"k": kv, "seed": s})
+        if feedback:
+            # --- Feedback mode: iterate by seed, then by ascending k ---
+            for s in seeds:
+                prev_mask: Optional[np.ndarray] = None
+                for kv in sorted_k_values:
+                    if (kv, s) in missing_jobs_set:
+                        pbar.set_postfix({"k": kv, "seed": s})
+                        result = run_single_optimization(
+                            obj_func=obj_func,
+                            L=L,
+                            k=kv,
+                            seed=s,
+                            method=method,
+                            method_params=method_params,
+                            initial_guess=prev_mask,
+                        )
+                        prev_mask = result["mask"]
 
-            result = run_single_optimization(
-                obj_func=obj_func,
-                L=L,
-                k=kv,
-                seed=s,
-                method=method,
-                method_params=method_params,
-            )
+                        packed = np.packbits(result["mask"].astype(np.uint8))
+                        run_idx_list.append(next_run_idx)
+                        k_list.append(kv)
+                        seed_list.append(s)
+                        best_value_list.append(result["best_value"])
+                        elapsed_s_list.append(result["elapsed_s"])
+                        n_obj_evals_list.append(result["n_obj_evals"])
+                        mask_bits_list.append(packed)
+                        next_run_idx += 1
+                        n_computed += 1
+                        pbar.update(1)
 
-            # Pack the mask
-            packed = np.packbits(result["mask"].astype(np.uint8))
+                        _checkpoint()
+                    else:
+                        # Already completed — load mask for chaining
+                        prev_mask = _load_existing_mask(kv, s)
+        else:
+            # --- Independent mode: process jobs in given order ---
+            for kv, s in [(kv, s) for kv in sorted_k_values for s in seeds]:
+                if (kv, s) not in missing_jobs_set:
+                    continue
+                pbar.set_postfix({"k": kv, "seed": s})
 
-            # Append results
-            run_idx_list.append(next_run_idx)
-            k_list.append(kv)
-            seed_list.append(s)
-            best_value_list.append(result["best_value"])
-            elapsed_s_list.append(result["elapsed_s"])
-            n_obj_evals_list.append(result["n_obj_evals"])
-            mask_bits_list.append(packed)
-            next_run_idx += 1
+                result = run_single_optimization(
+                    obj_func=obj_func,
+                    L=L,
+                    k=kv,
+                    seed=s,
+                    method=method,
+                    method_params=method_params,
+                )
 
-            # Checkpoint immediately: rewrite full NPZ atomically (temp + replace).
-            # This guarantees that after any crash, all completed datapoints up to
-            # the last successful checkpoint are present on disk.
-            if mask_bits_list:
-                mask_bits_arr = np.stack(mask_bits_list, axis=0)
-            else:
-                mask_bits_arr = np.array([], dtype=np.uint8).reshape(0, 0)
+                packed = np.packbits(result["mask"].astype(np.uint8))
+                run_idx_list.append(next_run_idx)
+                k_list.append(kv)
+                seed_list.append(s)
+                best_value_list.append(result["best_value"])
+                elapsed_s_list.append(result["elapsed_s"])
+                n_obj_evals_list.append(result["n_obj_evals"])
+                mask_bits_list.append(packed)
+                next_run_idx += 1
+                n_computed += 1
+                pbar.update(1)
 
-            _save_runs(
-                data_path=data_path,
-                run_idx=run_idx_list,
-                k=k_list,
-                seed=seed_list,
-                best_value=best_value_list,
-                elapsed_s=elapsed_s_list,
-                n_obj_evals=n_obj_evals_list,
-                mask_bits=mask_bits_arr,
-            )
+                _checkpoint()
     finally:
+        pbar.close()
         # Update metadata to reflect whatever is safely on disk.
         meta["k_values_present"] = sorted(set(int(x) for x in k_list))
         meta["seeds_present"] = sorted(set(int(x) for x in seed_list))
@@ -713,7 +790,7 @@ def compute_and_save(
         print(f"\nResults saved to: {run_dir}")
         print(
             f"Total runs in artifact: {len(run_idx_list)} "
-            f"(requested this call: {len(all_jobs)}, computed this call: {len(missing_jobs)})"
+            f"(requested this call: {len(all_jobs)}, computed this call: {n_computed})"
         )
     
     return run_dir
@@ -724,7 +801,7 @@ def compute_and_save(
 # -----------------------------------------------------------------------------
 
 def load_optimization_results(
-    run_dir: Path,
+    run_dir: Path | str,
     unpack_masks: bool = True,
 ) -> Dict[str, Any]:
     """Load optimization results from a run directory.
@@ -738,6 +815,7 @@ def load_optimization_results(
             - meta: metadata dict
             - data: dict of arrays (run_idx, k, seed, best_value, elapsed_s, n_obj_evals, masks)
     """
+    run_dir = Path(run_dir)
     meta_path = run_dir / "meta.json"
     data_path = run_dir / "data.npz"
     
@@ -754,7 +832,7 @@ def load_optimization_results(
     return {"meta": meta, "data": data}
 
 
-def results_to_dataframe(run_dir: Path) -> "pd.DataFrame":
+def results_to_dataframe(run_dir: Path | str) -> "pd.DataFrame":
     """Load results as a pandas DataFrame.
     
     Args:
@@ -781,7 +859,7 @@ def results_to_dataframe(run_dir: Path) -> "pd.DataFrame":
     return df
 
 
-def get_best_per_k(run_dir: Path) -> Dict[int, Dict[str, Any]]:
+def get_best_per_k(run_dir: Path | str) -> Dict[int, Dict[str, Any]]:
     """Get the best result for each k value.
     
     Args:
@@ -883,6 +961,14 @@ def main(argv: Optional[List[str]] = None) -> int:
     # RBM parameters
     p.add_argument("--rbm-steps", type=int, default=100, help="RBM: number of REINFORCE training steps")
 
+    # Feedback (warm-start chaining)
+    p.add_argument(
+        "--feedback",
+        action="store_true",
+        default=False,
+        help="Chain k-values: use best mask at k_i as initial_guess for k_{i+1}",
+    )
+
     # Sweep parameters
     k_group = p.add_mutually_exclusive_group(required=True)
     k_group.add_argument("--ks", nargs="+", type=int, help="Explicit list of k values")
@@ -957,7 +1043,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     
     model_params = model_params_from_args(args)
     symmetry_config = symmetry_config_from_args(args)
-    
+
     run_dir = compute_and_save(
         N=args.N,
         model_name=args.model,
@@ -976,6 +1062,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         resume=args.resume,
         force=args.force,
         verbose=args.verbose,
+        feedback=getattr(args, "feedback", False),
     )
     
     print(f"Results saved to: {run_dir}")

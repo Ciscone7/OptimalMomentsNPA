@@ -1,7 +1,6 @@
 import numpy as np
 import random
 import multiprocessing as mp
-from functools import lru_cache
 from tqdm import tqdm
 
 from typing import List, Dict, Optional, Any, Callable, Union
@@ -46,7 +45,6 @@ def _pt_sa_worker(
     )
 
 
-
 def simulated_annealing(
     obj_func: Callable[[np.ndarray], float],
     N: int,
@@ -78,9 +76,8 @@ def simulated_annealing(
         np.random.seed(seed)
         random.seed(seed)
 
-    # Objective cache: avoids redundant SDP solves on revisited states.
-    @lru_cache(maxsize=None)
-    def _cached_eval(key: tuple) -> float:
+
+    def _eval(key: tuple) -> float:
         if obj_uses_indices:
             return obj_func(list(key))
         m = np.zeros(N, dtype=int)
@@ -148,8 +145,8 @@ def simulated_annealing(
     # Track selected indices for efficient swapping (avoid O(N) scans)
     selected_indices = set(sel_indices)
     
-    # Initial evaluation (cached)
-    current_cost = _cached_eval(tuple(sorted(selected_indices)))
+    # Initial evaluation
+    current_cost = _eval(tuple(sorted(selected_indices)))
     
     best_selection = selection.copy()
     best_cost = current_cost
@@ -185,8 +182,8 @@ def simulated_annealing(
             selected_indices.remove(out_idx)
             selected_indices.add(in_idx)
 
-            # Evaluate (cached)
-            new_cost = _cached_eval(tuple(sorted(selected_indices)))
+            # Evaluate
+            new_cost = _eval(tuple(sorted(selected_indices)))
 
             # Acceptance Criterion
             delta = new_cost - current_cost
@@ -253,6 +250,7 @@ def parallel_tempering(
     steps_per_epoch: int = 50,
     T_min: float = 0.1,
     T_max: float = 10.0,
+    initial_guess: Optional[Union[List[int], np.ndarray]] = None,
     seed: Optional[int] = None,
     verbose: bool = True,
     obj_uses_indices: bool = False,
@@ -287,10 +285,23 @@ def parallel_tempering(
         print(f"Chains: {num_chains}")
         print(f"Temperatures (hot -> cold): {[float(f'{t:.4g}') for t in temperatures]}")
 
-    # Initialize replicas uniformly on S_N^k
+    # Initialize replicas; seed coldest chain from initial_guess if provided
     replicas_idx: List[set[int]] = []
-    for _ in range(num_chains):
-        idxs = set(int(i) for i in np.random.choice(N, k, replace=False).tolist())
+    for c in range(num_chains):
+        if c == num_chains - 1 and initial_guess is not None:
+            # Use initial_guess for the coldest chain (lowest temperature)
+            guess = np.asarray(initial_guess, dtype=int)
+            if guess.ndim == 1 and guess.shape[0] == N:
+                idxs = set(int(i) for i in np.flatnonzero(guess).tolist())
+            else:
+                idxs = set(int(i) for i in guess.tolist())
+            # If the guess has fewer than k indices, fill randomly
+            if len(idxs) < k:
+                pool = [i for i in range(N) if i not in idxs]
+                extras = np.random.choice(pool, k - len(idxs), replace=False)
+                idxs.update(int(i) for i in extras)
+        else:
+            idxs = set(int(i) for i in np.random.choice(N, k, replace=False).tolist())
         replicas_idx.append(idxs)
 
     def _mask_from_indices(idxs: set[int]) -> np.ndarray:

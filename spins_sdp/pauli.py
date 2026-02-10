@@ -19,6 +19,54 @@ _PHASE_RE: Final[Tuple[int, int, int, int]] = tuple(int(c.real) for c in _I_POW)
 _PHASE_IM: Final[Tuple[int, int, int, int]] = tuple(int(c.imag) for c in _I_POW)  # ( 0, 1, 0,-1)
 
 
+def _real_basis_coeff(n_y_i: int, n_y_j: int, std_phase: int, n_y_u: int) -> int:
+    """Coefficient for moment-matrix entry in the Ỹ=iY basis.
+
+    In this basis the moment matrix is *real-symmetric*.  Each entry is
+        M[i,j] = coeff · ỹ_u
+    where coeff ∈ {+1, −1} and ỹ_u = ⟨ũ⟩ is a real variable.
+
+    Derivation (D = diag(i^{n_Y(w_k)})):
+        M^~ = D* Γ D  →  M^~[i,j] = i^{−n_Y_i + n_Y_j + p − n_Y_u} · ỹ_u
+    The exponent is always 0 or 2 (mod 4), giving +1 or −1.
+
+    Parameters
+    ----------
+    n_y_i : Y-count of basis word w_i
+    n_y_j : Y-count of basis word w_j
+    std_phase : phase exponent p from standard multiply_words(w_i, w_j)
+    n_y_u : Y-count of the product word u = w_i w_j (label, ignoring phase)
+
+    Returns
+    -------
+    +1 or −1
+    """
+    exp = (-n_y_i + n_y_j + std_phase - n_y_u) & 3   # mod 4
+    # exp must be 0 or 2 for a correct real-basis;
+    # 1 or 3 would indicate non-real entries (bug).
+    return 1 if exp == 0 else -1
+
+
+def _real_basis_op_coeff(n_y_u: int) -> float:
+    """Operator coefficient correction in the Ỹ=iY basis.
+
+    Standard:  ⟨H⟩ = Σ c_u y_u
+    Real basis: ⟨H⟩ = Σ c_u · i^{−n_Y(u)} · ỹ_u = Σ c̃_u · ỹ_u
+
+    For Hamiltonians of physical interest (Heisenberg, Ising, …) every term
+    has even n_Y, so i^{−n_Y} ∈ {+1, −1} and c̃_u is real.
+    """
+    exp = (-n_y_u) & 3   # mod 4
+    if exp == 0:
+        return 1.0
+    if exp == 2:
+        return -1.0
+    raise ValueError(
+        f"Operator term with odd Y-count n_Y={n_y_u} is not supported "
+        f"by the real-basis (Ỹ=iY) transformation."
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class PauliWord:
     """
@@ -296,15 +344,12 @@ def compile_moment_matrix_rep(
     
     # Allocate Arrays
     # A = Real part, B = Imaginary part
-    # If use_real_operator is True, we don't allocate B
+    # When use_real_basis or use_real_operator is active, B is empty.
+    real_matrix = manager.use_real_basis or manager.use_real_operator
     
     label_idx = np.zeros((n, n), dtype=np.int32)
     A = np.zeros((n, n), dtype=np.float64)
-    
-    if manager.use_real_operator:
-        B = np.zeros((0, 0), dtype=np.float64)
-    else:
-        B = np.zeros((n, n), dtype=np.float64)
+    B = np.zeros((0, 0), dtype=np.float64) if real_matrix else np.zeros((n, n), dtype=np.float64)
 
     # Fill Matrix (Pass 2)
     for i in range(n):
@@ -332,22 +377,28 @@ def compile_moment_matrix_rep(
                 
             # If valid, look up index
             k = label_index[c]
-            
-            # Phase factors
-            re = _PHASE_RE[p]
-            
             label_idx[i, j] = k
             label_idx[j, i] = k
             
-            # Fill A (Real part)
-            A[i, j] = re
-            A[j, i] = re  # A is Symmetric
-            
-            # Fill B (Imaginary part) - ONLY if needed
-            if not manager.use_real_operator:
-                im = _PHASE_IM[p]
-                B[i, j] = im
-                B[j, i] = -im # B is Anti-Symmetric
+            if manager.use_real_basis:
+                # Ỹ=iY basis: coefficient is ±1 (real symmetric matrix)
+                n_y_i = (wi.x_mask & wi.z_mask).bit_count()
+                n_y_j = (wj.x_mask & wj.z_mask).bit_count()
+                n_y_u = (u.x_mask & u.z_mask).bit_count()
+                coeff = _real_basis_coeff(n_y_i, n_y_j, p, n_y_u)
+                A[i, j] = coeff
+                A[j, i] = coeff  # A is Symmetric
+            else:
+                # Standard Pauli basis
+                re = _PHASE_RE[p]
+                A[i, j] = re
+                A[j, i] = re  # A is Symmetric
+                
+                # Fill B (Imaginary part) - ONLY if needed
+                if not manager.use_real_operator:
+                    im = _PHASE_IM[p]
+                    B[i, j] = im
+                    B[j, i] = -im # B is Anti-Symmetric
 
     return PauliMomentMatrixRep(
         basis=basis,

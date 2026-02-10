@@ -8,7 +8,7 @@ import numpy as np
 import cvxpy as cp
 import scipy.sparse as sp
 
-from spins_sdp.pauli import compile_moment_matrix_rep, Operator, PauliMomentMatrixRep, PauliWord, multiply_words
+from spins_sdp.pauli import compile_moment_matrix_rep, Operator, PauliMomentMatrixRep, PauliWord, multiply_words, _real_basis_op_coeff
 from spins_sdp.symmetry import SymmetryManager
 
 # Later we will generalise this to account for the bell scenario
@@ -48,14 +48,25 @@ def compile_operator_linear_form(rep: PauliMomentMatrixRep, op: Operator, *, tol
     We allow small imaginary parts (numerical noise) and drop them; otherwise we raise.
     
     If symmetry_manager is provided, operator terms are canonicalized before lookup.
+
+    When use_real_basis is active, the variables are ỹ_u = i^{n_Y(u)} y_u, so each
+    coefficient is multiplied by i^{-n_Y(u)} (which is ±1 for even n_Y).
     """
+    
     m = len(rep.labels)
     c = np.zeros(m, dtype=float)
+    real_basis = symmetry_manager is not None and symmetry_manager.use_real_basis
 
     for u, coef in op.items():
         if abs(coef.imag) > tol:
             raise ValueError(f"Operator coefficient for {u} has significant imaginary part: {coef}")
         
+        # Real-basis coefficient correction: c̃_u = c_u · i^{-n_Y(u)}
+        raw_coef = float(coef.real)
+        if real_basis:
+            n_y = (u.x_mask & u.z_mask).bit_count()
+            raw_coef *= _real_basis_op_coeff(n_y)
+
         # Canonicalize the operator term if symmetry manager is provided
         lookup_key = u
         if symmetry_manager is not None:
@@ -67,7 +78,7 @@ def compile_operator_linear_form(rep: PauliMomentMatrixRep, op: Operator, *, tol
         
         if lookup_key not in rep.label_index:
             raise KeyError(f"Operator contains label not present in rep.labels: {u} (canonical: {lookup_key})")
-        c[rep.label_index[lookup_key]] += float(coef.real)
+        c[rep.label_index[lookup_key]] += raw_coef
 
     return c
 

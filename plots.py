@@ -29,7 +29,12 @@ from matplotlib.ticker import MaxNLocator
 import numpy as np
 import matplotlib.pyplot as plt
 
-from spins_sdp.basis_builder import generate_npa_basis, generate_heisenberg_paper_basis
+from spins_sdp.basis_builder import (
+    generate_npa_basis,
+    generate_heisenberg_paper_basis,
+    generate_heisenberg_j2_basis_weak,
+    generate_heisenberg_j2_basis_strong,
+)
 
 
 # =============================================================================
@@ -855,13 +860,34 @@ def _load_optimization_data(run_dir: Path) -> Tuple[Dict[str, Any], Dict[str, np
     return meta, data
 
 
+def _expected_relaxation_basis_size(
+    *,
+    basis: str,
+    N: int,
+    npa_level: Optional[int],
+) -> int:
+    basis_norm = str(basis)
+    if basis_norm == "npa":
+        if npa_level is None:
+            raise ValueError("npa_level must be provided when basis='npa'")
+        return int(len(generate_npa_basis(N=int(N), k=int(npa_level)).words))
+    if basis_norm == "heisenberg_simple":
+        return int(len(generate_heisenberg_paper_basis(N=int(N))))
+    if basis_norm == "heisenberg_j2_weak":
+        return int(len(generate_heisenberg_j2_basis_weak(N=int(N))))
+    if basis_norm == "heisenberg_j2_strong":
+        return int(len(generate_heisenberg_j2_basis_strong(N=int(N))))
+    raise ValueError(f"Unknown relaxation basis {basis!r}")
+
+
 def _get_full_relaxation_lower_bound_from_artifact(
     *,
     model: str,
     N: int,
     boundary: str,
     model_params: Dict[str, float],
-    end_level: int,
+    basis: str,
+    npa_level: Optional[int],
     solver: str,
     mosek_tol: float,
     symmetry: Optional[Dict[str, bool]] = None,
@@ -879,12 +905,15 @@ def _get_full_relaxation_lower_bound_from_artifact(
         "schema_version": 1,
         "model": model,
         "boundary": boundary,
-        "basis": "npa",
-        "npa_level": int(end_level),
+        "basis": str(basis),
         "method": "pauli_moment_relaxation",
         "sense": "min",
         "mosek_tol": float(mosek_tol),
     }
+    if str(basis) == "npa":
+        if npa_level is None:
+            raise ValueError("npa_level must be provided when basis='npa'")
+        meta_query["npa_level"] = int(npa_level)
     if model_params:
         meta_query["params"] = {k: float(v) for k, v in model_params.items()}
     if symmetry:
@@ -907,7 +936,11 @@ def _get_full_relaxation_lower_bound_from_artifact(
             # Staleness check: verify the stored basis_size matches the current code
             if len(basis_size_arr) > idx[0]:
                 stored_bs = int(basis_size_arr[idx[0]])
-                expected_bs = len(generate_npa_basis(N=int(N), k=int(end_level)).words)
+                expected_bs = _expected_relaxation_basis_size(
+                    basis=str(basis),
+                    N=int(N),
+                    npa_level=int(npa_level) if str(basis) == "npa" else None,
+                )
                 if stored_bs != expected_bs:
                     print(
                         f"[WARN] Stale artifact detected for N={N}: "
@@ -923,7 +956,8 @@ def _get_full_relaxation_lower_bound_from_artifact(
     print(
         "[WARN] Full-relaxation LB artifact not found (or missing requested N); "
         "skipping full-relaxation line and relative-improvement panel. "
-        f"model={model!r} N={int(N)} boundary={boundary!r} end_level={int(end_level)} "
+        f"model={model!r} N={int(N)} boundary={boundary!r} basis={str(basis)!r} "
+        f"npa_level={None if str(basis) != 'npa' else int(npa_level)} "
         f"solver={str(solver)!r} mosek_tol={float(mosek_tol)} params={params_msg}"
     )
     return float("nan")
@@ -986,7 +1020,9 @@ def plot_optimization_sweep(
     model_params: Optional[Dict[str, float]] = None,
     start_level: int = 1,
     end_level: int = 2,
+    end_basis: str = "npa",
     method: str = "sa",
+    feedback: Optional[bool] = None,
     exact_energy: Optional[float] = None,
     results_root: Optional[Path] = None,
     show_seeds: bool = False,
@@ -1048,10 +1084,13 @@ def plot_optimization_sweep(
             "boundary": boundary,
             "start_level": int(start_level),
             "end_level": int(end_level),
+            "end_basis": str(end_basis),
             "method": method,
         }
         if model_params:
             meta_query["model_params"] = {k: float(v) for k, v in model_params.items()}
+        if feedback is not None:
+            meta_query["feedback"] = feedback
     
     # Find and load run
     run_dir = _find_optimization_run_dir(
@@ -1067,6 +1106,8 @@ def plot_optimization_sweep(
     N = meta.get("N", N)
     boundary = meta.get("boundary", boundary)
     model_params = meta.get("model_params", model_params or {})
+    end_basis = meta.get("end_basis", end_basis)
+    end_level = int(meta.get("end_level", end_level))
     L = meta.get("L", meta.get("adding_set_size"))
     starting_set_size = meta.get("starting_set_size", 0)
     
@@ -1085,6 +1126,12 @@ def plot_optimization_sweep(
     k_arr = data["k"]
     best_value_arr = data["best_value"]
     seed_arr = data.get("seed", np.zeros_like(k_arr))
+
+    if len(k_arr) == 0:
+        raise ValueError(
+            "Optimization sweep artifact contains no runs. "
+            f"run_dir={run_dir} method={meta.get('method')!r} end_basis={meta.get('end_basis')!r}"
+        )
     
     # Compute best value per k (across all seeds)
     unique_ks = np.unique(k_arr)
@@ -1144,7 +1191,12 @@ def plot_optimization_sweep(
     
     ax1.set_xlabel("Number of added monomials (k)")
     ax1.set_ylabel(ylabel)
-    ax1.set_title(f"{model.capitalize()} N={N}: Lower Bound vs Added Monomials")
+    basis_desc = str(end_basis)
+    if str(end_basis) == "npa":
+        basis_desc = f"npa(k={int(end_level)})"
+    ax1.set_title(
+        f"{model.capitalize()} N={N}: Lower Bound vs Added Monomials\n(end_basis={basis_desc})"
+    )
     ax1.xaxis.set_major_locator(MaxNLocator(integer=True))
     ax1.grid(True, alpha=0.3)
     ax1.legend(loc="lower right")
@@ -1215,7 +1267,9 @@ def plot_optimization_convergence(
     model_params: Optional[Dict[str, float]] = None,
     start_level: int = 1,
     end_level: int = 2,
+    end_basis: str = "npa",
     method: str = "sa",
+    feedback: Optional[bool] = None,
     exact_energy: Optional[float] = None,
     full_relaxation_energy: Optional[float] = None,
     results_root: Optional[Path] = None,
@@ -1257,10 +1311,13 @@ def plot_optimization_convergence(
             "boundary": boundary,
             "start_level": int(start_level),
             "end_level": int(end_level),
+            "end_basis": str(end_basis),
             "method": method,
         }
         if model_params:
             meta_query["model_params"] = {k: float(v) for k, v in model_params.items()}
+        if feedback is not None:
+            meta_query["feedback"] = feedback
     
     run_dir = _find_optimization_run_dir(
         results_root=results_root,
@@ -1275,6 +1332,7 @@ def plot_optimization_convergence(
     boundary = meta.get("boundary", boundary)
     model_params = meta.get("model_params", model_params or {})
     end_level = int(meta.get("end_level", end_level))
+    end_basis = meta.get("end_basis", end_basis)
     L = meta.get("L", meta.get("adding_set_size"))
     starting_set_size = meta.get("starting_set_size", 0)
     
@@ -1291,6 +1349,12 @@ def plot_optimization_convergence(
     # Extract data
     k_arr = data["k"]
     best_value_arr = data["best_value"]
+
+    if len(k_arr) == 0:
+        raise ValueError(
+            "Optimization sweep artifact contains no runs. "
+            f"run_dir={run_dir} method={meta.get('method')!r} end_basis={meta.get('end_basis')!r}"
+        )
     
     # Compute best per k
     unique_ks = np.unique(k_arr)
@@ -1314,7 +1378,8 @@ def plot_optimization_convergence(
                 N=int(N),
                 boundary=boundary,
                 model_params=model_params,
-                end_level=end_level,
+                basis=str(end_basis),
+                npa_level=int(end_level) if str(end_basis) == "npa" else None,
                 solver=str(meta.get("solver", "MOSEK")),
                 mosek_tol=float(meta.get("mosek_tol", 1e-9)),
                 symmetry=meta.get("symmetry"),
@@ -1449,7 +1514,9 @@ def plot_optimization_seeds_comparison(
     model_params: Optional[Dict[str, float]] = None,
     start_level: int = 1,
     end_level: int = 2,
+    end_basis: str = "npa",
     method: str = "sa",
+    feedback: Optional[bool] = None,
     results_root: Optional[Path] = None,
     show: bool = True,
     save_path: Optional[Path] = None,
@@ -1478,10 +1545,13 @@ def plot_optimization_seeds_comparison(
             "boundary": boundary,
             "start_level": int(start_level),
             "end_level": int(end_level),
+            "end_basis": str(end_basis),
             "method": method,
         }
         if model_params:
             meta_query["model_params"] = {k: float(v) for k, v in model_params.items()}
+        if feedback is not None:
+            meta_query["feedback"] = feedback
     
     run_dir = _find_optimization_run_dir(
         results_root=results_root,
@@ -1493,8 +1563,13 @@ def plot_optimization_seeds_comparison(
     
     model = meta.get("model", model)
     N = meta.get("N", N)
-    
+
     k_arr = data["k"]
+    if len(k_arr) == 0:
+        raise ValueError(
+            "Optimization sweep artifact contains no runs. "
+            f"run_dir={run_dir} method={meta.get('method')!r} end_basis={meta.get('end_basis')!r}"
+        )
     best_value_arr = data["best_value"]
     seed_arr = data.get("seed", np.zeros_like(k_arr))
     
@@ -1580,8 +1655,10 @@ def plot_optimization_timing(
     model_params: Optional[Dict[str, float]] = None,
     start_level: int = 1,
     end_level: int = 2,
+    end_basis: str = "npa",
     method: str = "sa",
     method_params: Optional[Dict[str, Any]] = None,
+    feedback: Optional[bool] = None,
     results_root: Optional[Path] = None,
     show: bool = True,
     save_path: Optional[Path] = None,
@@ -1610,6 +1687,7 @@ def plot_optimization_timing(
             "boundary": boundary,
             "start_level": int(start_level),
             "end_level": int(end_level),
+            "end_basis": str(end_basis),
             "method": method,
         }
         if model_params:
@@ -1617,6 +1695,8 @@ def plot_optimization_timing(
         if method_params:
             # Subset match: you can provide only the keys you care about.
             meta_query["method_params"] = dict(sorted(method_params.items()))
+        if feedback is not None:
+            meta_query["feedback"] = feedback
     
     run_dir = _find_optimization_run_dir(
         results_root=results_root,
@@ -1716,7 +1796,9 @@ def plot_pt_optimization_timing_by_k(
     model_params: Optional[Dict[str, float]] = None,
     start_level: int = 1,
     end_level: int = 2,
+    end_basis: str = "npa",
     pt_params: Optional[Dict[str, Any]] = None,
+    feedback: Optional[bool] = None,
     results_root: Optional[Path] = None,
     show_points: bool = True,
     logy: bool = False,
@@ -1754,12 +1836,15 @@ def plot_pt_optimization_timing_by_k(
             "boundary": boundary,
             "start_level": int(start_level),
             "end_level": int(end_level),
+            "end_basis": str(end_basis),
             "method": "pt",
         }
         if model_params:
             meta_query["model_params"] = {k: float(v) for k, v in model_params.items()}
         if pt_params:
             meta_query["method_params"] = dict(sorted(pt_params.items()))
+        if feedback is not None:
+            meta_query["feedback"] = feedback
 
     run_dir = _find_optimization_run_dir(
         results_root=results_root,
@@ -2017,7 +2102,9 @@ def find_matching_runs(
     model_params: Optional[Dict[str, float]] = None,
     start_level: int = 1,
     end_level: int = 2,
+    end_basis: str = "npa",
     optimization_method: str = "sa",
+    feedback: Optional[bool] = None,
 ) -> Tuple[Optional[Path], Optional[Path]]:
     """Find matching optimization and random sampling runs.
     
@@ -2047,9 +2134,12 @@ def find_matching_runs(
         "boundary": boundary,
         "start_level": int(start_level),
         "end_level": int(end_level),
+        "end_basis": str(end_basis),
     }
     if model_params:
         base_query["model_params"] = {k: float(v) for k, v in model_params.items()}
+    if feedback is not None:
+        base_query["feedback"] = feedback
     
     opt_run = None
     random_run = None
@@ -2091,7 +2181,9 @@ def plot_optimization_vs_random(
     model_params: Optional[Dict[str, float]] = None,
     start_level: int = 1,
     end_level: int = 2,
+    end_basis: str = "npa",
     optimization_method: str = "sa",
+    feedback: Optional[bool] = None,
     exact_energy: Optional[float] = None,
     results_root: Optional[Path] = None,
     per_site: bool = False,
@@ -2141,7 +2233,9 @@ def plot_optimization_vs_random(
             model_params=model_params,
             start_level=start_level,
             end_level=end_level,
+            end_basis=end_basis,
             optimization_method=optimization_method,
+            feedback=feedback,
         )
     else:
         raise ValueError("Provide either opt_run_hash or (model, N)")
@@ -2157,7 +2251,9 @@ def plot_optimization_vs_random(
             model_params=model_params,
             start_level=start_level,
             end_level=end_level,
+            end_basis=end_basis,
             optimization_method=optimization_method,
+            feedback=feedback,
         )
     else:
         random_run = None
@@ -2384,6 +2480,7 @@ def plot_method_comparison(
     model_params: Optional[Dict[str, float]] = None,
     start_level: int = 1,
     end_level: int = 2,
+    end_basis: str = "npa",
     methods: Optional[List[str]] = None,
     exact_energy: Optional[float] = None,
     results_root: Optional[Path] = None,
@@ -2428,6 +2525,7 @@ def plot_method_comparison(
             "boundary": boundary,
             "start_level": int(start_level),
             "end_level": int(end_level),
+            "end_basis": str(end_basis),
             "method": method,
         }
         if model_params:

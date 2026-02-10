@@ -36,6 +36,8 @@ def _build_symmetry_args(global_cfg: dict) -> list[str]:
         args.append("--use-permutation")
     if sym_cfg.get("use_real_operator"):
         args.append("--use-real-operator")
+    if sym_cfg.get("use_real_basis"):
+        args.append("--use-real-basis")
     return args
 
 
@@ -222,6 +224,10 @@ def run_optimization(cfg: dict, global_cfg: dict, dry_run: bool) -> None:
                     "--bo-candidates-per-iter", str(method_cfg.get("candidates_per_iter", 50)),
                 ])
             
+            # Feedback (warm-start chaining across k values)
+            if method_cfg.get("feedback", False):
+                cmd.append("--feedback")
+
             if global_cfg.get("resume"):
                 cmd.append("--resume")
             if global_cfg.get("verbose"):

@@ -163,7 +163,9 @@ def add_symmetry_args(parser: argparse.ArgumentParser) -> None:
     sym_group.add_argument("--use-permutation", action="store_true", default=False,
                           help="Group by X/Y/Z relabeling")
     sym_group.add_argument("--use-real-operator", action="store_true", default=False,
-                          help="Restrict to real-valued moments")
+                          help="Restrict to real-valued moments (drops Im part — may weaken bound)")
+    sym_group.add_argument("--use-real-basis", action="store_true", default=False,
+                          help="Use Ỹ=iY basis (real SDP without losing tightness)")
     sym_group.add_argument("--use-all-symmetries", action="store_true", default=False,
                           help="Enable all symmetries (shortcut)")
 
@@ -177,7 +179,8 @@ def symmetry_config_from_args(args: argparse.Namespace) -> Dict[str, bool]:
             "use_translation": True,
             "use_mirror": True,
             "use_permutation": True,
-            "use_real_operator": True,
+            "use_real_operator": False,
+            "use_real_basis": True,
         }
     return {
         "use_rotation": getattr(args, "use_rotation", False),
@@ -186,6 +189,7 @@ def symmetry_config_from_args(args: argparse.Namespace) -> Dict[str, bool]:
         "use_mirror": getattr(args, "use_mirror", False),
         "use_permutation": getattr(args, "use_permutation", False),
         "use_real_operator": getattr(args, "use_real_operator", False),
+        "use_real_basis": getattr(args, "use_real_basis", False),
     }
 
 

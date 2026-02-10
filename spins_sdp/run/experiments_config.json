@@ -11,7 +11,8 @@
             "use_translation": true,
             "use_mirror": true,
             "use_permutation": true,
-            "use_real_operator": true
+            "use_real_operator": false,
+            "use_real_basis": true
         }
     },
 
@@ -48,9 +49,9 @@
             "k_step": 20,
             "methods": {
                 "random": {"enabled": true, "num_seeds": 10},
-                "sa": {"enabled": false, "steps": 10, "num_seeds": 2},
-                "pt": {"enabled": true, "chains": null, "epochs": 0, "steps_per_epoch": 40, "num_seeds": 1, "T_min": 0.1, "T_max": 2.0},
-                "bo": {"enabled": false, "n_init": 10, "n_iter": 10, "candidates_per_iter": 10, "num_seeds": 2}
+                "sa": {"enabled": false, "steps": 10, "num_seeds": 2, "feedback": false},
+                "pt": {"enabled": true, "chains": null, "epochs": 0, "steps_per_epoch": 40, "num_seeds": 1, "T_min": 0.1, "T_max": 2.0, "feedback": false},
+                "bo": {"enabled": false, "n_init": 10, "n_iter": 10, "candidates_per_iter": 10, "num_seeds": 2, "feedback": false}
             }
         }
     },
@@ -90,9 +91,9 @@
             "k_step": 40,
             "methods": {
                 "random": {"enabled": true, "num_seeds": 5},
-                "sa": {"enabled": false, "steps": 100, "num_seeds": 10},
-                "pt": {"enabled": true, "chains": null, "epochs": 5, "steps_per_epoch": 40, "num_seeds": 1, "T_min": 0.1, "T_max": 2.0},
-                "bo": {"enabled": false, "n_init": 10, "n_iter": 30, "candidates_per_iter": 50, "num_seeds": 10}
+                "sa": {"enabled": false, "steps": 100, "num_seeds": 10, "feedback": false},
+                "pt": {"enabled": true, "chains": null, "epochs": 5, "steps_per_epoch": 40, "num_seeds": 1, "T_min": 0.1, "T_max": 2.0, "feedback": false},
+                "bo": {"enabled": false, "n_init": 10, "n_iter": 30, "candidates_per_iter": 50, "num_seeds": 10, "feedback": false}
             }
         }
     }

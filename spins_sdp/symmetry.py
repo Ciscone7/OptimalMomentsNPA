@@ -17,7 +17,8 @@ class SymmetryManager:
     use_translation: bool = False        # Group by translation orbits
     use_mirror: bool = False             # Group by spatial reflection
     use_permutation: bool = False        # Group by X/Y/Z relabeling
-    use_real_operator: bool = False     # Restrict to real-valued moments (only when the operator is real)
+    use_real_operator: bool = False     # Restrict to real-valued moments (loosens the bound)
+    use_real_basis: bool = False        # Use Ỹ=iY basis (makes moment matrix real without losing tightness)
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to a dictionary for serialization/config hashing."""
@@ -30,7 +31,12 @@ class SymmetryManager:
     
     @classmethod
     def default_for_heisenberg(cls, N: int) -> "SymmetryManager":
-        """Return default symmetry settings optimized for Heisenberg model."""
+        """Return default symmetry settings optimized for Heisenberg model.
+        
+        Note: use_real_operator is False because the moment matrix M[i,j] = i^p * y_u
+        has complex entries from Pauli multiplication phases, even when the operator
+        and ground state are real.  Dropping the imaginary part weakens the PSD constraint.
+        """
         return cls(
             N=N,
             use_rotation=True,
@@ -38,9 +44,10 @@ class SymmetryManager:
             use_translation=True,
             use_mirror=True,
             use_permutation=True,
-            use_real_operator=True,
+            use_real_operator=False,
+            use_real_basis=True,
         )
-    
+
     @classmethod
     def none(cls, N: int) -> "SymmetryManager":
         """Return a SymmetryManager with no symmetries enabled."""
@@ -105,10 +112,14 @@ class SymmetryManager:
                (w.support_size(), w.x_mask, w.z_mask):
                 spatial_best = w_refl
 
-        # 3. Permutation Minimization (S3)
+        # 3. Permutation Minimization
         # Now that the string is spatially anchored (e.g., at site 0),
         # we rotate X/Y/Z labels to find the final canonical form.
         if self.use_permutation:
+            if self.use_real_basis:
+                # In the Ỹ=iY basis the Hamiltonian is XX-ỸỸ+ZZ, so only
+                # X↔Z is a valid permutation symmetry (not the full S₃).
+                return canonicalize_xz_swap(spatial_best)
             return canonicalize_permutation(spatial_best)
         
         return spatial_best
@@ -163,6 +174,19 @@ def apply_permutation(w: PauliWord, p: Tuple[int, int, int]) -> PauliWord:
             new_z_mask |= bit
             
     return PauliWord(new_x_mask, new_z_mask)
+
+@lru_cache(maxsize=None)
+def canonicalize_xz_swap(w: PauliWord) -> PauliWord:
+    """Return the smaller of w and its X↔Z-swapped version.
+
+    X↔Z swaps x_mask and z_mask (Y sites, which have both bits set, are
+    unchanged).  This is the residual permutation symmetry in the Ỹ=iY basis.
+    """
+    swapped = PauliWord(w.z_mask, w.x_mask)
+    w_key = (w.support_size(), w.x_mask, w.z_mask)
+    s_key = (swapped.support_size(), swapped.x_mask, swapped.z_mask)
+    return swapped if s_key < w_key else w
+
 
 @lru_cache(maxsize=None)
 def canonicalize_permutation(w: PauliWord) -> PauliWord:

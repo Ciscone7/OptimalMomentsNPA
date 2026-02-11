@@ -312,6 +312,113 @@ def heisenberg_j2_hamiltonian_dict(N: int, J2: float, boundary: BoundaryType = "
     return op
 
 
+# =============================================================================
+# Common observables (Pauli-dict form)
+# =============================================================================
+
+def magnetization_z_dict(N: int) -> Operator:
+    r"""Uniform z-magnetization per site: :math:`\frac{1}{N}\sum_i Z_i`."""
+    op: Operator = {}
+    for i in range(N):
+        w = PauliWord(0, 1 << i)
+        op[w] = op.get(w, 0.0) + 1.0 / N
+    return op
+
+
+def staggered_magnetization_z_dict(N: int) -> Operator:
+    r"""Staggered z-magnetization: :math:`\frac{1}{N}\sum_i (-1)^i Z_i`."""
+    op: Operator = {}
+    for i in range(N):
+        w = PauliWord(0, 1 << i)
+        op[w] = op.get(w, 0.0) + ((-1) ** i) / N
+    return op
+
+
+def nearest_neighbor_correlation_dict(
+    N: int,
+    axis: str = "z",
+    boundary: BoundaryType = "periodic",
+) -> Operator:
+    r"""Average nearest-neighbour correlation along one axis.
+
+    .. math::
+        \frac{1}{N_{\text{bonds}}} \sum_{\langle i,j\rangle}
+        \sigma_i^a \sigma_j^a
+
+    Args:
+        N: Number of sites.
+        axis: ``"x"``, ``"y"``, or ``"z"``.
+        boundary: ``"open"`` or ``"periodic"``.
+    """
+    n_bonds = N if boundary == "periodic" else N - 1
+    if n_bonds == 0:
+        return {}
+    op: Operator = {}
+    for i in range(N):
+        if i < N - 1 or boundary == "periodic":
+            j = (i + 1) % N
+            if axis == "x":
+                w = PauliWord((1 << i) | (1 << j), 0)
+            elif axis == "y":
+                w = PauliWord((1 << i) | (1 << j), (1 << i) | (1 << j))
+            elif axis == "z":
+                w = PauliWord(0, (1 << i) | (1 << j))
+            else:
+                raise ValueError(f"Unknown axis {axis!r}")
+            op[w] = op.get(w, 0.0) + 1.0 / n_bonds
+    return op
+
+
+def two_point_correlation_dict(
+    N: int,
+    i: int,
+    j: int,
+    axis: str = "z",
+) -> Operator:
+    r"""Single two-point correlator :math:`\sigma_i^a \sigma_j^a`.
+
+    Args:
+        N: Number of sites (used to validate indices).
+        i, j: Site indices.
+        axis: ``"x"``, ``"y"``, or ``"z"``.
+    """
+    if not (0 <= i < N and 0 <= j < N):
+        raise ValueError(f"Site indices i={i}, j={j} out of range for N={N}")
+    if i == j:
+        # σ_i^a σ_i^a = I
+        return {PauliWord(0, 0): 1.0}
+    if axis == "x":
+        w = PauliWord((1 << i) | (1 << j), 0)
+    elif axis == "y":
+        w = PauliWord((1 << i) | (1 << j), (1 << i) | (1 << j))
+    elif axis == "z":
+        w = PauliWord(0, (1 << i) | (1 << j))
+    else:
+        raise ValueError(f"Unknown axis {axis!r}")
+    return {w: 1.0}
+
+
+def single_site_pauli_dict(N: int, site: int, axis: str) -> Operator:
+    r"""Single Pauli operator :math:`\sigma_{\text{site}}^{\text{axis}}`.
+
+    Args:
+        N: Number of sites.
+        site: Site index.
+        axis: ``"x"``, ``"y"``, or ``"z"``.
+    """
+    if not (0 <= site < N):
+        raise ValueError(f"Site {site} out of range for N={N}")
+    if axis == "x":
+        w = PauliWord(1 << site, 0)
+    elif axis == "y":
+        w = PauliWord(1 << site, 1 << site)
+    elif axis == "z":
+        w = PauliWord(0, 1 << site)
+    else:
+        raise ValueError(f"Unknown axis {axis!r}")
+    return {w: 1.0}
+
+
 
 
 

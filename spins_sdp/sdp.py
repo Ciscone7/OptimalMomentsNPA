@@ -185,16 +185,34 @@ def build_block_reps(full_basis: List[PauliWord], symmetry_manager: SymmetryMana
     return reps, global_index
 
 
+# Type alias for extra linear constraints on the y vector.
+# Each entry is (coeff_vector, sense, rhs) where sense is "<=" or ">=".
+LinearConstraintSpec = Tuple[np.ndarray, Literal["<=", ">="], float]
+
+
 def build_block_diagonal_sdp(
     reps: List[PauliMomentMatrixRep],
     objective_op: Operator,
     sense: Sense = "min",
-    symmetry_manager: Optional[SymmetryManager] = None
+    symmetry_manager: Optional[SymmetryManager] = None,
+    extra_constraints: Optional[List[LinearConstraintSpec]] = None,
 ) -> PauliMomentSDP:
     """
     Constructs a Block-Diagonal SDP from a list of Moment Matrix blocks (reps).
     Handles both Real Symmetric blocks (if rep.b_coef is empty) and 
     Complex Hermitian blocks (via real embedding) automatically.
+    
+    Args:
+        reps: Compiled moment-matrix block representations (shared global labels).
+        objective_op: The operator to minimise/maximise.
+        sense: "min" or "max".
+        symmetry_manager: Active symmetry settings (needed for operator compilation).
+        extra_constraints: Optional list of extra linear constraints on y.
+            Each element is ``(c, sense, rhs)`` where ``c`` is a coefficient
+            vector (length m), ``sense`` is ``"<=" `` or ``">="``, and ``rhs``
+            is a scalar.  For example an energy window ``E_L <= <H> <= E_U``
+            becomes two entries:
+            ``[(c_H, ">=", E_L), (c_H, "<=", E_U)]``.
     """
     if not reps:
         raise ValueError("Must provide at least one block rep.")
@@ -241,6 +259,16 @@ def build_block_diagonal_sdp(
             K = cp.bmat([[A, -B], [B, A]])
             constraints.append(K >> 0)
     
+    # Extra linear constraints (e.g. energy bounds)
+    if extra_constraints:
+        for coef_vec, cst_sense, rhs in extra_constraints:
+            if cst_sense == "<=":
+                constraints.append(coef_vec @ y <= rhs)
+            elif cst_sense == ">=":
+                constraints.append(coef_vec @ y >= rhs)
+            else:
+                raise ValueError(f"Unknown constraint sense {cst_sense!r}; use '<=' or '>='")
+
     # Objective Function
     c = compile_operator_linear_form(rep0, objective_op, symmetry_manager=symmetry_manager)
     obj_expr = c @ y
@@ -257,6 +285,130 @@ def build_block_diagonal_sdp(
         constraints=constraints,
         objective=obj_expr,
         problem=problem
+    )
+
+
+# ------------------------------------------------------------------
+# Observable bounding given energy constraints
+# ------------------------------------------------------------------
+
+@dataclass(frozen=True, slots=True)
+class ObservableBoundResult:
+    """Result of bounding an observable given energy constraints."""
+    lb: float                   # lower bound on <O>
+    ub: float                   # upper bound on <O>
+    energy_lb: float            # energy lower bound used
+    energy_ub: float            # energy upper bound used
+    sdp_lb: Optional[PauliMomentSDP] = None  # SDP object for the lb solve
+    sdp_ub: Optional[PauliMomentSDP] = None  # SDP object for the ub solve
+
+
+def bound_observable(
+    basis: List[PauliWord],
+    hamiltonian: Operator,
+    observable: Operator,
+    energy_lb: float,
+    energy_ub: float,
+    symmetry_manager: SymmetryManager,
+    mosek_tol: float = 1e-6,
+    verbose: bool = False,
+) -> ObservableBoundResult:
+    """Bound the ground-state expectation value of an observable.
+
+    Given that the ground-state energy satisfies
+    ``energy_lb <= E_0 <= energy_ub``, solve two SDPs
+
+        min / max  <O>
+        s.t.  Gamma >= 0,  <I> = 1,
+              energy_lb <= <H> <= energy_ub
+
+    to obtain certified lower and upper bounds on ``<O>``.
+
+    Args:
+        basis: Pauli words defining the moment-relaxation basis.  Must
+            contain all words needed to represent *both* ``hamiltonian``
+            and ``observable``.
+        hamiltonian: The Hamiltonian operator (``Operator`` dict).
+        observable: The target observable (``Operator`` dict).
+        energy_lb: Lower bound on the ground-state energy (e.g. from an
+            SDP relaxation).
+        energy_ub: Upper bound on the ground-state energy (e.g. from
+            exact diagonalisation, DMRG, or variational methods).
+        symmetry_manager: Symmetry settings.
+        mosek_tol: MOSEK solver tolerance.
+        verbose: If ``True``, print solver output.
+
+    Returns:
+        :class:`ObservableBoundResult` with certified ``lb`` and ``ub``.
+    """
+    if energy_lb > energy_ub + 1e-12:
+        raise ValueError(
+            f"energy_lb ({energy_lb}) > energy_ub ({energy_ub}); "
+            "the energy window is empty."
+        )
+
+    # Build block-diagonal representations (shared across both solves)
+    reps, _ = build_block_reps(basis, symmetry_manager)
+
+    # Compile the Hamiltonian constraint: energy_lb <= c_H @ y <= energy_ub
+    rep0 = reps[0]
+    c_H = compile_operator_linear_form(
+        rep0, hamiltonian, symmetry_manager=symmetry_manager,
+    )
+    energy_constraints: List[LinearConstraintSpec] = [
+        (c_H, ">=", energy_lb),
+        (c_H, "<=", energy_ub),
+    ]
+
+    def _solve_with_retry(problem, mosek_tol, verbose, max_retries=3):
+        """Solve with MOSEK, retrying with looser tolerances on failure."""
+        from cvxpy.error import SolverError
+        tol = mosek_tol
+        for attempt in range(max_retries):
+            opts = {
+                "mosek_params": {
+                    "MSK_DPAR_INTPNT_CO_TOL_REL_GAP": tol,
+                    "MSK_DPAR_INTPNT_CO_TOL_PFEAS": tol,
+                    "MSK_DPAR_INTPNT_CO_TOL_DFEAS": tol,
+                }
+            }
+            try:
+                problem.solve(solver="MOSEK", verbose=verbose, **opts)
+                if problem.status in ("optimal", "optimal_inaccurate"):
+                    return
+            except SolverError:
+                pass
+            tol *= 10  # loosen tolerance and retry
+        raise SolverError(
+            f"MOSEK failed after {max_retries} retries "
+            f"(final tol={tol/10:.0e}). Try verbose=True."
+        )
+
+    # --- Minimise <O> ---
+    sdp_min = build_block_diagonal_sdp(
+        reps, observable, sense="min",
+        symmetry_manager=symmetry_manager,
+        extra_constraints=energy_constraints,
+    )
+    _solve_with_retry(sdp_min.problem, mosek_tol, verbose)
+    lb = float(sdp_min.problem.value)
+
+    # --- Maximise <O> ---
+    sdp_max = build_block_diagonal_sdp(
+        reps, observable, sense="max",
+        symmetry_manager=symmetry_manager,
+        extra_constraints=energy_constraints,
+    )
+    _solve_with_retry(sdp_max.problem, mosek_tol, verbose)
+    ub = float(sdp_max.problem.value)
+
+    return ObservableBoundResult(
+        lb=lb,
+        ub=ub,
+        energy_lb=energy_lb,
+        energy_ub=energy_ub,
+        sdp_lb=sdp_min,
+        sdp_ub=sdp_max,
     )
 
 

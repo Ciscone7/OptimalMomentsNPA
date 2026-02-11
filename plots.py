@@ -1489,6 +1489,119 @@ def plot_optimization_convergence(
     if show:
         plt.show()
     
+    # ------------------------------------------------------------------
+    # Error-threshold tables
+    # ------------------------------------------------------------------
+    threshold_table_exact: Optional[List[Dict[str, Any]]] = None
+    threshold_table_relax: Optional[List[Dict[str, Any]]] = None
+
+    def _build_threshold_rows(
+        errors: np.ndarray,
+    ) -> List[Dict[str, Any]]:
+        """Build threshold rows for a given error array (positive = LB below ref)."""
+        max_exp = int(np.floor(np.log10(max(abs(errors[0]), 1e-15))))
+        min_exp_data = int(np.floor(np.log10(max(abs(errors[-1]), 1e-15))))
+        thresholds = [10.0 ** e for e in range(max_exp, min_exp_data - 1, -1)]
+        rows: List[Dict[str, Any]] = []
+        for thr in thresholds:
+            idxs = np.where(errors <= thr)[0]
+            if len(idxs) > 0:
+                first = idxs[0]
+                rows.append({
+                    "threshold": thr,
+                    "k": int(ks_sorted[first]),
+                    "fraction_pct": float(fraction[first] * 100),
+                    "energy": float(best_vals[first]),
+                    "error": float(errors[first]),
+                })
+            else:
+                rows.append({
+                    "threshold": thr,
+                    "k": None,
+                    "fraction_pct": None,
+                    "energy": None,
+                    "error": None,
+                })
+        return rows
+
+    def _print_threshold_table(
+        rows: List[Dict[str, Any]], title: str, ref_label: str, ref_value: float,
+    ) -> None:
+        print(f"\n{'─'*72}")
+        print(f"  {title}  ({ref_label} = {ref_value:.8f})")
+        print(f"{'─'*72}")
+        print(f"  {'Threshold':>14}  {'k':>6}  {'% of L':>8}  {'Energy LB':>14}  {'Error':>12}")
+        print(f"  {'─'*14}  {'─'*6}  {'─'*8}  {'─'*14}  {'─'*12}")
+        for row in rows:
+            thr_str = (
+                f"{row['threshold']}"
+                if isinstance(row["threshold"], str)
+                else f"≤ 1e{int(np.log10(row['threshold'])):+d}"
+            )
+            if row["k"] is not None:
+                print(
+                    f"  {thr_str:>14}  {row['k']:>6d}  {row['fraction_pct']:>7.1f}%"
+                    f"  {row['energy']:>14.8f}  {row['error']:>12.2e}"
+                )
+            else:
+                print(f"  {thr_str:>14}  {'—':>6}  {'—':>8}  {'—':>14}  {'not reached':>12}")
+        print(f"{'─'*72}")
+
+    # --- Table 1: gap to full relaxation ---
+    if full_relaxation_energy is not None:
+        errors_relax = full_relaxation_energy - best_vals  # positive when LB < full
+        rows_relax = _build_threshold_rows(errors_relax)
+
+        # Special row: first k that matches full relaxation within 1e-8
+        gap_to_full = np.abs(best_vals - full_relaxation_energy)
+        idxs_full = np.where(gap_to_full <= 1e-8)[0]
+        if len(idxs_full) > 0:
+            first = idxs_full[0]
+            rows_relax.append({
+                "threshold": "= full relax",
+                "k": int(ks_sorted[first]),
+                "fraction_pct": float(fraction[first] * 100),
+                "energy": float(best_vals[first]),
+                "error": float(errors_relax[first]),
+            })
+
+        threshold_table_relax = rows_relax
+        _print_threshold_table(
+            rows_relax,
+            title="Gap to full relaxation",
+            ref_label="E_full",
+            ref_value=full_relaxation_energy,
+        )
+
+    # --- Table 2: gap to exact energy ---
+    if exact_energy is not None:
+        errors_exact = exact_energy - best_vals  # positive (LB ≤ E₀)
+        rows_exact = _build_threshold_rows(errors_exact)
+
+        # Special row: matched full relaxation
+        if full_relaxation_energy is not None:
+            gap_to_full = np.abs(best_vals - full_relaxation_energy)
+            idxs_full = np.where(gap_to_full <= 1e-8)[0]
+            if len(idxs_full) > 0:
+                first = idxs_full[0]
+                rows_exact.append({
+                    "threshold": "= full relax",
+                    "k": int(ks_sorted[first]),
+                    "fraction_pct": float(fraction[first] * 100),
+                    "energy": float(best_vals[first]),
+                    "error": float(errors_exact[first]),
+                })
+
+        threshold_table_exact = rows_exact
+        _print_threshold_table(
+            rows_exact,
+            title="Gap to exact energy",
+            ref_label="E₀",
+            ref_value=exact_energy,
+        )
+
+    print()
+    
     return {
         "run_dir": run_dir,
         "k": ks_sorted,
@@ -1500,6 +1613,8 @@ def plot_optimization_convergence(
         "full_relaxation_energy_source": full_relaxation_source,
         "starting_energy": starting_energy,
         "L": L,
+        "threshold_table_exact": threshold_table_exact,
+        "threshold_table_relax": threshold_table_relax,
         "figure": fig,
         "axes": axes,
     }
@@ -3371,3 +3486,242 @@ def print_time_vs_n_vars_forecast_table(
         hours = mins / 60
         days = hours / 24
         print(f"{L:<12} {t:<12.3e} {mins:<12.3e} {hours:<12.3e} {days:<12.3e}")
+
+
+# =============================================================================
+# Basis comparison: heisenberg_simple vs NPA optimized subsets
+# =============================================================================
+
+
+def plot_basis_optimality_comparison(
+    *,
+    heis_run_hash: str,
+    npa_run_hash: str,
+    results_root: Optional[Path] = None,
+    show: bool = True,
+    save_path: Optional[Path] = None,
+) -> Dict[str, Any]:
+    """Compare optimization sweeps from two different ending bases.
+
+    The central question: does a larger search space (NPA level-4) contain a
+    subset of size |heisenberg_simple| that yields a tighter bound than the
+    full heisenberg_simple relaxation?
+
+    The **x-axis** of the convergence plots is normalised so that 100 %
+    corresponds to the size of the heisenberg_simple basis (L_heis).
+
+    Produces three subplots:
+      1. Raw energy vs number of monomials added (both runs on common k axis).
+      2. Energy vs fraction of heisenberg_simple basis (with reference lines).
+      3. Time efficiency: energy vs wall-clock time.
+
+    Args:
+        heis_run_hash: Config hash of the heisenberg_simple sweep.
+        npa_run_hash:  Config hash of the NPA-4 sweep.
+        results_root:  Override default results directory.
+        show:  Whether to call ``plt.show()``.
+        save_path:  If provided, save figure to this path.
+
+    Returns:
+        Dict with loaded data, reference energies, and the figure.
+    """
+    results_root = results_root or _default_results_root()
+
+    # ------------------------------------------------------------------
+    # Load both optimisation sweeps
+    # ------------------------------------------------------------------
+    heis_dir = _find_optimization_run_dir(
+        results_root=results_root, run_hash=heis_run_hash,
+    )
+    npa_dir = _find_optimization_run_dir(
+        results_root=results_root, run_hash=npa_run_hash,
+    )
+    heis_meta, heis_data = _load_optimization_data(heis_dir)
+    npa_meta, npa_data = _load_optimization_data(npa_dir)
+
+    N = int(heis_meta["N"])
+    model = heis_meta["model"]
+    boundary = heis_meta.get("boundary", "periodic")
+    model_params = heis_meta.get("model_params", {})
+    L_heis = int(heis_meta["adding_set_size"])  # 100 % reference
+    L_npa = int(npa_meta["adding_set_size"])
+    starting_size = int(heis_meta.get("starting_set_size", 0))
+
+    # ------------------------------------------------------------------
+    # Best-per-k for each run
+    # ------------------------------------------------------------------
+    def _best_per_k(data: Dict[str, np.ndarray]):
+        k_arr = data["k"]
+        bv = data["best_value"]
+        uks = np.unique(k_arr)
+        bpk = {int(k): float(np.max(bv[k_arr == k])) for k in uks}
+        ks = np.array(sorted(bpk.keys()))
+        vals = np.array([bpk[k] for k in ks])
+        return ks, vals
+
+    heis_ks, heis_vals = _best_per_k(heis_data)
+    npa_ks, npa_vals = _best_per_k(npa_data)
+
+    # ------------------------------------------------------------------
+    # Reference energies from artifacts
+    # ------------------------------------------------------------------
+    exact_energy, _ = _get_exact_energy_from_artifact(
+        model=model, N=N, boundary=boundary,
+        model_params=model_params, results_root=results_root,
+    )
+
+    # Full heisenberg_simple relaxation
+    heis_full_lb = _get_full_relaxation_lower_bound_from_artifact(
+        model=model, N=N, boundary=boundary, model_params=model_params,
+        basis="heisenberg_simple", npa_level=None,
+        solver="MOSEK", mosek_tol=float(heis_meta.get("mosek_tol", 1e-9)),
+        symmetry=heis_meta.get("symmetry"), results_root=results_root,
+    )
+    if not np.isfinite(heis_full_lb):
+        # Fall back to best value in the heisenberg sweep at k=L_heis
+        heis_bpk = dict(zip(heis_ks.tolist(), heis_vals.tolist()))
+        heis_full_lb = heis_bpk.get(L_heis, float(np.max(heis_vals)))
+
+    # ------------------------------------------------------------------
+    # Does NPA-4 ever beat heisenberg_simple at same budget?
+    # ------------------------------------------------------------------
+    # Interpolate NPA values at the heisenberg k-points for fair comparison
+    npa_at_heis_budget = np.interp(heis_ks, npa_ks, npa_vals)
+    npa_beats_heis = bool(np.any(npa_at_heis_budget > heis_full_lb + 1e-10))
+
+    # Find the NPA value at k = L_heis (or closest)
+    npa_val_at_L_heis = float(np.interp(L_heis, npa_ks, npa_vals))
+
+    # ------------------------------------------------------------------
+    # Time data
+    # ------------------------------------------------------------------
+    heis_elapsed = heis_data.get("elapsed_s")
+    npa_elapsed = npa_data.get("elapsed_s")
+
+    def _time_per_k(data, ks_sorted, vals_sorted):
+        k_arr = data["k"]
+        el = data.get("elapsed_s")
+        if el is None:
+            return None
+        bpk_t = {}
+        for k in ks_sorted:
+            mask = k_arr == k
+            idx_best = np.argmax(data["best_value"][mask])
+            bpk_t[int(k)] = float(el[mask][idx_best])
+        return np.array([bpk_t[k] for k in ks_sorted])
+
+    heis_times = _time_per_k(heis_data, heis_ks, heis_vals)
+    npa_times = _time_per_k(npa_data, npa_ks, npa_vals)
+
+    # ------------------------------------------------------------------
+    # Plotting
+    # ------------------------------------------------------------------
+    fig, axes = plt.subplots(1, 3, figsize=(20, 6))
+
+    # ---- Panel 1: Raw energy vs k (absolute number of monomials added) ----
+    ax1 = axes[0]
+    ax1.plot(heis_ks + starting_size, heis_vals, "o-", linewidth=2,
+             label=f"heisenberg_simple (L={L_heis})", color="tab:blue")
+    ax1.plot(npa_ks + starting_size, npa_vals, "s-", linewidth=2,
+             label=f"NPA-4 (L={L_npa})", color="tab:orange")
+    if exact_energy is not None:
+        ax1.axhline(exact_energy, color="red", ls="--", lw=2,
+                     label=f"Exact $E_0 = {exact_energy:.6f}$")
+    ax1.axhline(heis_full_lb, color="green", ls=":", lw=2,
+                label=f"Full heis. simple = {heis_full_lb:.6f}")
+    ax1.axvline(L_heis + starting_size, color="tab:blue", ls="--", lw=1, alpha=0.5,
+                label=f"|heis. simple| = {L_heis}")
+    ax1.set_xlabel("Total basis size (starting + k added)")
+    ax1.set_ylabel("Energy lower bound")
+    ax1.set_title(f"Heisenberg N={N}: raw convergence")
+    ax1.legend(fontsize=8)
+    ax1.grid(True, alpha=0.3)
+
+    # ---- Panel 2: Energy vs fraction of heisenberg_simple basis ----
+    ax2 = axes[1]
+    heis_frac = heis_ks / L_heis * 100
+    npa_frac = npa_ks / L_heis * 100  # can exceed 100 %
+    ax2.plot(heis_frac, heis_vals, "o-", linewidth=2,
+             label="heisenberg_simple", color="tab:blue")
+    ax2.plot(npa_frac, npa_vals, "s-", linewidth=2,
+             label="NPA-4 optimised subset", color="tab:orange")
+    if exact_energy is not None:
+        ax2.axhline(exact_energy, color="red", ls="--", lw=2, label="Exact $E_0$")
+    ax2.axhline(heis_full_lb, color="green", ls=":", lw=2,
+                label="Full heis. simple relaxation")
+    ax2.axvline(100, color="tab:blue", ls="--", lw=1, alpha=0.5,
+                label="100 % of heis. simple")
+    # Annotate NPA value at the heisenberg budget
+    ax2.plot(100, npa_val_at_L_heis, "*", markersize=14, color="tab:orange",
+             zorder=5, label=f"NPA-4 @ 100 % = {npa_val_at_L_heis:.6f}")
+    ax2.set_xlabel("Fraction of heisenberg_simple basis (%)")
+    ax2.set_ylabel("Energy lower bound")
+    ax2.set_title(f"Normalised comparison (100 % = |heis. simple| = {L_heis})")
+    ax2.legend(fontsize=8)
+    ax2.grid(True, alpha=0.3)
+
+    # ---- Panel 3: Energy vs wall-clock time (efficiency) ----
+    ax3 = axes[2]
+    if heis_times is not None:
+        ax3.plot(heis_times, heis_vals, "o-", linewidth=2,
+                 label="heisenberg_simple", color="tab:blue")
+    if npa_times is not None:
+        ax3.plot(npa_times, npa_vals, "s-", linewidth=2,
+                 label="NPA-4", color="tab:orange")
+    if exact_energy is not None:
+        ax3.axhline(exact_energy, color="red", ls="--", lw=2, label="Exact $E_0$")
+    ax3.axhline(heis_full_lb, color="green", ls=":", lw=2,
+                label="Full heis. simple")
+    ax3.set_xlabel("Wall-clock time (s)")
+    ax3.set_ylabel("Energy lower bound")
+    ax3.set_title("Time efficiency")
+    ax3.legend(fontsize=8)
+    ax3.grid(True, alpha=0.3)
+
+    plt.suptitle(
+        f"Heisenberg N={N}: heisenberg_simple vs NPA-4 optimised subset",
+        fontsize=14, y=1.02,
+    )
+    plt.tight_layout()
+
+    if save_path is not None:
+        fig.savefig(save_path, bbox_inches="tight")
+    if show:
+        plt.show()
+
+    # ------------------------------------------------------------------
+    # Summary printout
+    # ------------------------------------------------------------------
+    print(f"\n{'='*60}")
+    print(f"  Basis optimality comparison – Heisenberg N={N}")
+    print(f"{'='*60}")
+    if exact_energy is not None:
+        print(f"  Exact E₀             : {exact_energy:.8f}")
+    print(f"  Full heis. simple LB  : {heis_full_lb:.8f}")
+    print(f"  Best heis. sweep      : {float(np.max(heis_vals)):.8f}  (k={heis_ks[np.argmax(heis_vals)]})")
+    print(f"  Best NPA-4 sweep      : {float(np.max(npa_vals)):.8f}  (k={npa_ks[np.argmax(npa_vals)]})")
+    print(f"  NPA-4 @ k=L_heis      : {npa_val_at_L_heis:.8f}")
+    gap_full = heis_full_lb - npa_val_at_L_heis
+    print(f"  Gap (heis full – NPA@L): {gap_full:+.8f}  ({'heis tighter' if gap_full > 0 else 'NPA tighter'})")
+    if exact_energy is not None:
+        print(f"  |heis full – exact|   : {abs(heis_full_lb - exact_energy):.8f}")
+        print(f"  |NPA@L – exact|       : {abs(npa_val_at_L_heis - exact_energy):.8f}")
+    print(f"  NPA-4 ever beats heis : {'YES' if npa_beats_heis else 'No'}")
+    print(f"  |heis. simple| (L)    : {L_heis}")
+    print(f"  |NPA-4 adding set|    : {L_npa}")
+    print(f"{'='*60}\n")
+
+    return {
+        "heis_ks": heis_ks,
+        "heis_vals": heis_vals,
+        "npa_ks": npa_ks,
+        "npa_vals": npa_vals,
+        "exact_energy": exact_energy,
+        "heis_full_lb": heis_full_lb,
+        "npa_val_at_L_heis": npa_val_at_L_heis,
+        "npa_beats_heis": npa_beats_heis,
+        "L_heis": L_heis,
+        "L_npa": L_npa,
+        "figure": fig,
+        "axes": axes,
+    }

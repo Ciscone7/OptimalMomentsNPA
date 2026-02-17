@@ -3,7 +3,7 @@ from dataclasses import dataclass, asdict
 from functools import lru_cache
 from typing import Optional, List, Set, Tuple, Dict, Any
 
-from spins_sdp.pauli import PauliWord, is_variant_under_sign_symmetries
+from spins.pauli_logic import PauliWord, is_variant_under_sign_symmetries
 
 @dataclass(frozen=True)
 class SymmetryManager:

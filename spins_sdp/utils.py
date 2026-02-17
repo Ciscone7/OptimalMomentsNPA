@@ -24,10 +24,10 @@ def _require_pandas():
         ) from e
     return pd
 
-from spins_sdp.basis_builder import generate_npa_basis
-from spins_sdp.pauli import Operator, PauliWord
-from spins_sdp.models import ising_hamiltonian_exact, ising_hamiltonian_dict
-from spins_sdp.sdp import solve_pauli_relaxation
+from spins.basis_builder import generate_npa_basis
+from spins.pauli_logic import Operator, PauliWord
+from spins.models import ising_hamiltonian_exact, ising_hamiltonian_dict
+from spins.spins_sdp import solve_pauli_relaxation
 
 
 
@@ -228,15 +228,6 @@ def Z(i: int) -> PauliWord: return PauliWord(0, 1 << i)
 def Y(i: int) -> PauliWord: 
     b = 1 << i
     return PauliWord(b, b)
-
-
-# --- Optimization ---
-
-def optimization_wrapper_spins(x, starting_set, adding_set, hamiltonian_expression):
-    chosen_additions = [s for val, s in zip(x, adding_set) if val]
-    total_moments = starting_set + chosen_additions
-
-    return solve_pauli_relaxation(total_moments, hamiltonian_expression ,sense = "min")
 
 
 # ---------- Results/Artifacts: list available hashes ----------

@@ -2,7 +2,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Dict, List, Set, Tuple, Optional
 
-from spins_sdp.pauli import PauliWord, multiply_words, local_pauli, reduce_monomial
+from spins.pauli_logic import PauliWord, multiply_words, local_pauli, reduce_monomial
 
 @dataclass(frozen=True, slots=True)
 class PauliNPABasis:

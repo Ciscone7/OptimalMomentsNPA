@@ -164,7 +164,7 @@ def run_optimization(cfg: dict, global_cfg: dict, dry_run: bool) -> None:
     adding_sizes_by_N: dict[int, int] = {}
     try:
         # Local import to keep runner lightweight.
-        from spins_sdp.basis_builder import generate_npa_basis
+        from spins.basis_builder import generate_npa_basis
 
         for N in Ns:
             full_basis = generate_npa_basis(N=int(N), k=end_level)

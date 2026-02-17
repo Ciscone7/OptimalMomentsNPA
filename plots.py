@@ -29,7 +29,7 @@ from matplotlib.ticker import MaxNLocator
 import numpy as np
 import matplotlib.pyplot as plt
 
-from spins_sdp.basis_builder import (
+from spins.basis_builder import (
     generate_npa_basis,
     generate_heisenberg_paper_basis,
     generate_heisenberg_j2_basis_weak,
@@ -3724,4 +3724,434 @@ def plot_basis_optimality_comparison(
         "L_npa": L_npa,
         "figure": fig,
         "axes": axes,
+    }
+
+
+# =============================================================================
+# Fixed-fraction scaling: gap vs system size
+# =============================================================================
+
+def list_fraction_scaling_runs(
+    *,
+    results_root: Optional[Path] = None,
+    model: Optional[str] = None,
+    method: Optional[str] = None,
+    verbose: bool = True,
+) -> List[Dict[str, Any]]:
+    """List available fraction-scaling runs.
+
+    Args:
+        results_root: Override default results directory.
+        model: Filter by model name.
+        method: Filter by method name.
+        verbose: If True, print a formatted table.
+
+    Returns:
+        List of run info dicts.
+    """
+    results_root = results_root or _default_results_root()
+
+    runs: List[Dict[str, Any]] = []
+    for run_dir in _iter_run_dirs(results_root, "spin_fraction_scaling", 1):
+        try:
+            meta = _load_meta(run_dir)
+        except Exception:
+            continue
+
+        if model is not None and meta.get("model") != model:
+            continue
+        if method is not None and meta.get("method") != method:
+            continue
+
+        runs.append({
+            "hash": run_dir.name,
+            "model": meta.get("model"),
+            "boundary": meta.get("boundary"),
+            "fraction": meta.get("fraction"),
+            "method": meta.get("method"),
+            "end_basis": meta.get("end_basis"),
+            "start_level": meta.get("start_level"),
+            "Ns_present": meta.get("Ns_present", []),
+            "total_runs": meta.get("total_runs", 0),
+            "_run_dir": str(run_dir),
+        })
+
+    if verbose:
+        if not runs:
+            print("No fraction-scaling runs found.")
+        else:
+            print(f"{'Hash':<18} {'Model':<12} {'Basis':<18} "
+                  f"{'p':>5} {'Method':<8} {'Ns':<20} {'Runs':>5}")
+            print("-" * 90)
+            for r in runs:
+                ns_str = ",".join(str(n) for n in r["Ns_present"])
+                print(
+                    f"{r['hash']:<18} {r['model'] or '?':<12} "
+                    f"{r.get('end_basis', '?'):<18} "
+                    f"{r.get('fraction', '?'):>5} {r.get('method', '?'):<8} "
+                    f"{ns_str:<20} {r['total_runs']:>5}"
+                )
+
+    return runs
+
+
+def plot_fraction_scaling(
+    *,
+    run_hash: Optional[str] = None,
+    model: Optional[str] = None,
+    boundary: str = "periodic",
+    model_params: Optional[Dict[str, float]] = None,
+    start_level: int = 1,
+    end_basis: str = "heisenberg_simple",
+    end_level: int = 2,
+    fraction: Optional[float] = None,
+    method: Optional[str] = None,
+    results_root: Optional[Path] = None,
+    per_site: bool = False,
+    log_y: bool = True,
+    show: bool = True,
+    save_path: Optional[Path] = None,
+) -> Dict[str, Any]:
+    """Plot the gap |E_full − E_partial| vs system size N.
+
+    Loads results from a ``spin_fraction_scaling`` artifact and plots the
+    gap between the full relaxation and the optimised partial relaxation
+    at ``k = floor(fraction * L)`` for each N.
+
+    Two lookup modes:
+
+    1. **Hash-based** – provide ``run_hash``.
+    2. **Param-based** – provide ``model``, ``fraction``, and optionally
+       other fields to match against stored ``meta.json``.
+
+    Args:
+        run_hash: Explicit config hash of the run.
+        model, boundary, model_params: Model specification.
+        start_level, end_basis, end_level: Basis specification.
+        fraction: Monomial fraction p (used for meta matching).
+        method: Optimisation method (used for meta matching).
+        results_root: Override default results directory.
+        per_site: If True, plot gap / N.
+        log_y: If True, use log scale on y-axis (when all gaps > 0).
+        show: Whether to call ``plt.show()``.
+        save_path: If provided, save figure to this path.
+
+    Returns:
+        Dict with run metadata, arrays, and the figure.
+    """
+    results_root = results_root or _default_results_root()
+
+    # ---- find run dir ----
+    meta_query = None
+    if run_hash is None:
+        if model is None or fraction is None:
+            raise ValueError("Provide run_hash or (model, fraction, ...)")
+        meta_query: Dict[str, Any] = {
+            "artifact": "spin_fraction_scaling",
+            "model": model,
+            "boundary": boundary,
+            "start_level": int(start_level),
+            "end_basis": end_basis,
+            "fraction": float(fraction),
+        }
+        if method is not None:
+            meta_query["method"] = method
+        if model_params:
+            meta_query["model_params"] = {
+                k: float(v) for k, v in model_params.items()
+            }
+
+    run_dir = _find_run_dir(
+        results_root=results_root,
+        artifact="spin_fraction_scaling",
+        schema_version=1,
+        run_hash=run_hash,
+        meta_query=meta_query,
+    )
+
+    meta = _load_meta(run_dir)
+    data = _load_npz(run_dir)
+
+    fraction_val = meta.get("fraction", fraction)
+    method_name = meta.get("method", method or "?")
+    model_name = meta.get("model", model or "?")
+    N_vals = data["N"].astype(int)
+
+    # ---- aggregate per N: pick best (highest) E_partial over seeds ----
+    unique_Ns = sorted(set(int(n) for n in N_vals))
+
+    best_gap: Dict[int, float] = {}
+    best_E_partial: Dict[int, float] = {}
+    E_full_by_N: Dict[int, float] = {}
+    k_by_N: Dict[int, int] = {}
+    L_by_N: Dict[int, int] = {}
+
+    for N in unique_Ns:
+        mask = N_vals == N
+        E_partials = data["E_partial"][mask]
+        best_idx = int(np.argmax(E_partials))  # tightest LB
+        E_full_by_N[N] = float(data["E_full"][mask][best_idx])
+        best_E_partial[N] = float(E_partials[best_idx])
+        best_gap[N] = float(E_full_by_N[N] - best_E_partial[N])
+        k_by_N[N] = int(data["k"][mask][best_idx])
+        L_by_N[N] = int(data["adding_set_size"][mask][best_idx])
+
+    Ns_arr = np.array(unique_Ns)
+    gaps_arr = np.abs(np.array([best_gap[N] for N in unique_Ns]))
+    if per_site:
+        gaps_arr = gaps_arr / Ns_arr
+
+    # ---- plot ----
+    fig, ax = plt.subplots(1, 1, figsize=(8, 5))
+
+    ax.plot(Ns_arr, gaps_arr, "o-", color="C0", markersize=7, linewidth=2)
+
+    if log_y and np.all(gaps_arr > 0):
+        ax.set_yscale("log")
+
+    ylabel = r"$|E_{\mathrm{full}} - E_{\mathrm{partial}}|$"
+    if per_site:
+        ylabel += " / N"
+    ax.set_xlabel("System size N", fontsize=12)
+    ax.set_ylabel(ylabel, fontsize=12)
+    ax.set_title(
+        f"Fraction scaling: p={fraction_val}, method={method_name}\n"
+        f"({model_name}, {meta.get('end_basis', end_basis)}, "
+        f"start_level={meta.get('start_level', start_level)})",
+        fontsize=13,
+    )
+    ax.grid(True, alpha=0.3)
+    ax.xaxis.set_major_locator(MaxNLocator(integer=True))
+
+    # Annotate k/L on each point
+    for N in unique_Ns:
+        y_val = abs(best_gap[N]) / N if per_site else abs(best_gap[N])
+        ax.annotate(
+            f"k={k_by_N[N]}/{L_by_N[N]}",
+            (N, y_val),
+            textcoords="offset points",
+            xytext=(0, 10),
+            ha="center",
+            fontsize=8,
+            color="gray",
+        )
+
+    fig.tight_layout()
+
+    if save_path:
+        fig.savefig(save_path, dpi=150, bbox_inches="tight")
+    if show:
+        plt.show()
+
+    # ---- summary table ----
+    gap_hdr = "|Gap|/N" if per_site else "|Gap|"
+    print(
+        f"\n{'N':>4} {'L':>6} {'k':>6} {'k/L':>6} "
+        f"{'E_full':>14} {'E_partial':>14} "
+        f"{'|Gap|':>12} {'|Gap|/N':>12}"
+    )
+    print("-" * 82)
+    for N in unique_Ns:
+        ratio = k_by_N[N] / L_by_N[N] if L_by_N[N] > 0 else 0.0
+        abs_gap = abs(best_gap[N])
+        print(
+            f"{N:4d} {L_by_N[N]:6d} {k_by_N[N]:6d} {ratio:6.2f} "
+            f"{E_full_by_N[N]:14.8f} {best_E_partial[N]:14.8f} "
+            f"{abs_gap:12.2e} {abs_gap / N:12.2e}"
+        )
+
+    return {
+        "run_dir": run_dir,
+        "meta": meta,
+        "Ns": Ns_arr,
+        "gaps": gaps_arr,
+        "E_full": E_full_by_N,
+        "E_partial": best_E_partial,
+        "k_by_N": k_by_N,
+        "L_by_N": L_by_N,
+        "figure": fig,
+        "axes": ax,
+    }
+
+
+def plot_fraction_scaling_comparison(
+    *,
+    fractions: List[float],
+    run_hashes: Optional[List[str]] = None,
+    model: str = "heisenberg",
+    boundary: str = "periodic",
+    model_params: Optional[Dict[str, float]] = None,
+    start_level: int = 1,
+    end_basis: str = "heisenberg_simple",
+    methods: Optional[List[str]] = None,
+    results_root: Optional[Path] = None,
+    per_site: bool = True,
+    log_y: bool = True,
+    show: bool = True,
+    save_path: Optional[Path] = None,
+) -> Dict[str, Any]:
+    """Overlay gap vs N curves for multiple fractions p on the same axes.
+
+    Looks up one ``spin_fraction_scaling`` artifact per fraction value and
+    plots them together for easy comparison.
+
+    Two lookup modes per fraction:
+
+    1. **Hash-based** – provide ``run_hashes`` (same length as *fractions*).
+    2. **Param-based** – provide ``model``, ``boundary``, etc.; each
+       fraction is matched independently against stored ``meta.json``.
+
+    Args:
+        fractions: List of fraction values (e.g. [0.3, 0.5, 0.7]).
+        run_hashes: Optional list of explicit hashes, one per fraction.
+        model, boundary, model_params: Model specification.
+        start_level, end_basis: Basis specification.
+        methods: Optional list of methods, one per fraction.  If a single
+            string is given it is reused for all fractions.
+        results_root: Override default results directory.
+        per_site: If True, plot gap / N (default True).
+        log_y: If True, use log scale on y-axis.
+        show: Whether to call ``plt.show()``.
+        save_path: If provided, save figure to this path.
+
+    Returns:
+        Dict with ``figure``, ``axes``, and per-fraction data.
+    """
+    results_root = results_root or _default_results_root()
+    model_params = model_params or {}
+
+    if run_hashes is not None and len(run_hashes) != len(fractions):
+        raise ValueError("run_hashes must have the same length as fractions")
+    if methods is not None:
+        if isinstance(methods, str):
+            methods = [methods] * len(fractions)
+        elif len(methods) != len(fractions):
+            raise ValueError("methods must have the same length as fractions")
+
+    fig, ax = plt.subplots(1, 1, figsize=(9, 6))
+    colors = plt.cm.viridis(np.linspace(0.15, 0.85, len(fractions)))
+    all_data: Dict[float, Dict[str, Any]] = {}
+
+    for idx, frac in enumerate(fractions):
+        rh = run_hashes[idx] if run_hashes else None
+        method = methods[idx] if methods else None
+
+        meta_query: Optional[Dict[str, Any]] = None
+        if rh is None:
+            meta_query = {
+                "artifact": "spin_fraction_scaling",
+                "model": model,
+                "boundary": boundary,
+                "start_level": int(start_level),
+                "end_basis": end_basis,
+                "fraction": float(frac),
+            }
+            if method is not None:
+                meta_query["method"] = method
+            if model_params:
+                meta_query["model_params"] = {
+                    k: float(v) for k, v in model_params.items()
+                }
+
+        try:
+            run_dir = _find_run_dir(
+                results_root=results_root,
+                artifact="spin_fraction_scaling",
+                schema_version=1,
+                run_hash=rh,
+                meta_query=meta_query,
+            )
+        except FileNotFoundError:
+            print(f"  [skip] No artifact found for p={frac}")
+            continue
+
+        meta = _load_meta(run_dir)
+        data = _load_npz(run_dir)
+
+        N_vals = data["N"].astype(int)
+        unique_Ns = sorted(set(int(n) for n in N_vals))
+
+        best_gap: Dict[int, float] = {}
+        k_by_N: Dict[int, int] = {}
+        L_by_N: Dict[int, int] = {}
+
+        for N in unique_Ns:
+            mask = N_vals == N
+            E_partials = data["E_partial"][mask]
+            best_idx = int(np.argmax(E_partials))
+            E_full = float(data["E_full"][mask][best_idx])
+            best_gap[N] = E_full - float(E_partials[best_idx])
+            k_by_N[N] = int(data["k"][mask][best_idx])
+            L_by_N[N] = int(data["adding_set_size"][mask][best_idx])
+
+        Ns_arr = np.array(unique_Ns)
+        gaps_arr = np.abs(np.array([best_gap[N] for N in unique_Ns]))
+        if per_site:
+            gaps_arr = gaps_arr / Ns_arr
+
+        method_name = meta.get("method", "?")
+        label = f"p={frac}"
+        if method_name != "?":
+            label += f" ({method_name})"
+
+        ax.plot(
+            Ns_arr, gaps_arr, "o-",
+            color=colors[idx], markersize=6, linewidth=2,
+            label=label,
+        )
+
+        all_data[frac] = {
+            "Ns": Ns_arr,
+            "gaps": gaps_arr,
+            "k_by_N": k_by_N,
+            "L_by_N": L_by_N,
+            "method": method_name,
+            "meta": meta,
+        }
+
+    if log_y and all(
+        np.all(d["gaps"] > 0) for d in all_data.values()
+    ):
+        ax.set_yscale("log")
+
+    ylabel = r"$|E_{\mathrm{full}} - E_{\mathrm{partial}}|$"
+    if per_site:
+        ylabel += " / N"
+    ax.set_xlabel("System size N", fontsize=12)
+    ax.set_ylabel(ylabel, fontsize=12)
+    ax.set_title(
+        f"Fraction scaling comparison ({model}, {end_basis})",
+        fontsize=13,
+    )
+    ax.legend(fontsize=11)
+    ax.grid(True, alpha=0.3)
+    ax.xaxis.set_major_locator(MaxNLocator(integer=True))
+    fig.tight_layout()
+
+    if save_path:
+        fig.savefig(save_path, dpi=150, bbox_inches="tight")
+    if show:
+        plt.show()
+
+    # ---- summary table ----
+    print(f"\n{'p':>5} {'N':>4} {'L':>6} {'k':>6} {'k/L':>6} "
+          f"{'|Gap|':>12} {'|Gap|/N':>12}")
+    print("-" * 60)
+    for frac in sorted(all_data):
+        d = all_data[frac]
+        for i, N in enumerate(d["Ns"]):
+            N = int(N)
+            L = d["L_by_N"][N]
+            k = d["k_by_N"][N]
+            ratio = k / L if L > 0 else 0.0
+            abs_gap = float(d["gaps"][i]) * (N if per_site else 1)
+            print(
+                f"{frac:5.2f} {N:4d} {L:6d} {k:6d} {ratio:6.2f} "
+                f"{abs_gap:12.2e} {abs_gap / N:12.2e}"
+            )
+
+    return {
+        "figure": fig,
+        "axes": ax,
+        "data": all_data,
     }

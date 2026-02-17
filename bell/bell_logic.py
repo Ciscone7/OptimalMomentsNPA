@@ -27,8 +27,6 @@ from functools import lru_cache
 from typing import Dict, List, Literal, Optional, Tuple
 
 import numpy as np
-import cvxpy as cp
-import scipy.sparse as sp
 
 
 # Sentinel value meaning "this setting is not present in the word"
@@ -397,15 +395,14 @@ def compile_moment_matrix_rep(basis: BellBasis) -> BellMomentMatrixRep:
     )
 
 
+# ---------------------------------------------------------------------------
+# Type aliases (canonical home — re-exported by bell_sdp too)
+# ---------------------------------------------------------------------------
 
-def _canonicalize_for_moment(
-    w: BellWord,
-    rep: BellMomentMatrixRep,
-) -> Optional[int]:
-    c = _canonicalize(w)
-    if c in rep.label_index:
-        return rep.label_index[c]
-    return None
+BellOperator = Dict[BellWord, float]
+"""Mapping from Bell words to real coefficients."""
+
+Sense = Literal["min", "max"]
 
 
 def expand_bell_operator(
@@ -481,108 +478,6 @@ def _expand_word(
 
     # No last-outcome projectors — word is already in the reduced basis
     out[w] = out.get(w, 0.0) + coef
-
-
-# ---------------------------------------------------------------------------
-# SDP Assembly
-# ---------------------------------------------------------------------------
-
-BellOperator = Dict[BellWord, float]
-Sense = Literal["min", "max"]
-
-
-@dataclass(frozen=True, slots=True)
-class BellMomentSDP:
-    rep: BellMomentMatrixRep
-    y: cp.Variable
-    M: cp.Expression
-    constraints: List[cp.Constraint]
-    objective: cp.Expression
-    problem: cp.Problem
-
-
-def build_moment_matrix_expression(
-    rep: BellMomentMatrixRep,
-    y: cp.Variable,
-) -> cp.Expression:
-    n = len(rep.basis)
-    m = len(rep.labels)
-
-    rows = []
-    cols = []
-    data = []
-
-    for j in range(n):
-        for i in range(n):
-            flat_idx = i + j * n
-            k = rep.label_idx[i, j]
-            if k >= 0:
-                rows.append(flat_idx)
-                cols.append(k)
-                data.append(1.0)
-
-    C = sp.coo_matrix((data, (rows, cols)), shape=(n * n, m)).tocsr()
-    M_vec = cp.Constant(C) @ y
-    M = cp.reshape(M_vec, (n, n), order="F")
-    return M
-
-
-def compile_operator_linear_form(
-    rep: BellMomentMatrixRep,
-    op: BellOperator,
-) -> np.ndarray:
-    m = len(rep.labels)
-    c = np.zeros(m, dtype=float)
-    for u, coef in op.items():
-        idx = _canonicalize_for_moment(u, rep)
-        if idx is None:
-            raise KeyError(f"Operator contains label not in rep.labels: {u}")
-        c[idx] += coef
-    return c
-
-
-def build_bell_sdp(
-    rep: BellMomentMatrixRep,
-    objective_op: BellOperator,
-    *,
-    sense: Sense = "max",
-    extra_constraints: Optional[List[cp.Constraint]] = None,
-) -> BellMomentSDP:
-    """
-    Build the SDP for the Bell NPA hierarchy.
-
-    Because the generator set already excludes the last outcome per setting
-    (completeness is baked in via E_{d-1|x} = I - sum_{a<d-1} E_{a|x}),
-    the only constraints are:
-      - y[I] = 1  (normalisation)
-      - M >> 0    (positive semidefiniteness)
-    """
-    m = len(rep.labels)
-    y = cp.Variable(m, name="y")
-
-    M = build_moment_matrix_expression(rep, y)
-
-    constraints: List[cp.Constraint] = []
-    constraints.append(y[rep.idx_I] == 1.0)
-    constraints.append(M >> 0)
-
-    if extra_constraints:
-        constraints.extend(extra_constraints)
-
-    c = compile_operator_linear_form(rep, objective_op)
-    obj_expr = c @ y
-
-    objective = cp.Maximize(obj_expr) if sense == "max" else cp.Minimize(obj_expr)
-    problem = cp.Problem(objective, constraints)
-
-    return BellMomentSDP(
-        rep=rep,
-        y=y,
-        M=M,
-        constraints=constraints,
-        objective=obj_expr,
-        problem=problem,
-    )
 
 
 # ---------------------------------------------------------------------------

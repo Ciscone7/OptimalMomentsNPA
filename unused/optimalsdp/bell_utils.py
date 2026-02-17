@@ -410,7 +410,7 @@ class MomentMatrix_Bell():
         #problem_diagnose(C, Gamma, constraints, self.projectors_indices, op_exprs=bell_ineq)
         objective = cp.Maximize(cp.trace(C_const.T @ Gamma))
         problem = cp.Problem(objective, constraints)
-        problem.solve(solver=cp.SCS)
+        problem.solve(solver="MOSEK")
 
         
         return Gamma.value, problem.value

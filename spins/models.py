@@ -10,7 +10,7 @@ dictionary builders for each spin model.
 import qutip as qt
 from typing import Literal
 
-from spins_sdp.pauli import Operator, PauliWord
+from spins.pauli_logic import Operator, PauliWord
 
 
 BoundaryType = Literal["open", "periodic"]

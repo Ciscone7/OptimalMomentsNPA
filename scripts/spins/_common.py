@@ -1,17 +1,18 @@
 from __future__ import annotations
 
 import time
-from typing import Any, Dict, Iterable, List, Tuple
+from typing import Any, Dict, List, Tuple
 import argparse
 
-from spins_sdp import models
-from spins_sdp.basis_builder import (
+from spins import models
+from spins.basis_builder import (
     generate_npa_basis,
     generate_heisenberg_paper_basis,
     generate_heisenberg_j2_basis_weak,
     generate_heisenberg_j2_basis_strong,
 )
-from spins_sdp.symmetry import SymmetryManager
+
+from spins.spins_optimize import build_npa_basis_sets
 
 
 def time_best_avg(fn, repeats: int) -> Tuple[Any, float, float]:
@@ -75,30 +76,6 @@ def hamiltonian_dict_fn(model_name: str):
     raise ValueError(f"Unknown model: {model_name}")
 
 
-def build_npa_basis_sets(
-    N: int,
-    start_level: int,
-    end_level: int,
-):
-    """Return (starting_set, adding_set, final_set) for NPA levels."""
-    full_basis = generate_npa_basis(N=N, k=end_level)
-    
-    # Extract starting set: concatenate levels 0 through start_level (inclusive)
-    starting_set = []
-    for level_idx in range(min(start_level + 1, len(full_basis.levels))): # The min is in case start_level == max level
-        starting_set.extend(full_basis.levels[level_idx])
-    
-    # Extract adding set: concatenate levels start_level+1 through end_level (inclusive)
-    adding_set = []
-    for level_idx in range(start_level + 1, min(end_level + 1, len(full_basis.levels))):
-        adding_set.extend(full_basis.levels[level_idx])
-    
-    # Final set is just all words
-    final_set = full_basis.words
-    
-    return starting_set, adding_set, final_set
-
-
 # Mapping from CLI name to generator function (no extra args beyond N).
 _NAMED_BASIS_GENERATORS = {
     "heisenberg_simple": generate_heisenberg_paper_basis,
@@ -127,12 +104,13 @@ def build_basis_sets(
     end_level : int
         NPA level for the final set (only used when ``end_basis="npa"``).
     """
-    # Build the starting set from NPA levels 0..start_level
+    if end_basis == "npa":
+        # Fast path: generate the full NPA basis once (at end_level) and slice levels.
+        return build_npa_basis_sets(N=N, start_level=start_level, end_level=end_level)
+
+    # Named-basis path: build the starting set from NPA levels 0..start_level.
     start_npa = generate_npa_basis(N=N, k=start_level)
     starting_set = list(start_npa.words)  # all words up to start_level
-
-    if end_basis == "npa":
-        return build_npa_basis_sets(N=N, start_level=start_level, end_level=end_level)
 
     # Named basis: generate the full word list, subtract the starting set.
     gen = _NAMED_BASIS_GENERATORS.get(end_basis)
@@ -192,7 +170,3 @@ def symmetry_config_from_args(args: argparse.Namespace) -> Dict[str, bool]:
         "use_real_basis": getattr(args, "use_real_basis", False),
     }
 
-
-def make_symmetry_manager(N: int, symmetry_config: Dict[str, bool]) -> SymmetryManager:
-    """Create a SymmetryManager from N and a symmetry config dict."""
-    return SymmetryManager(N=N, **symmetry_config)

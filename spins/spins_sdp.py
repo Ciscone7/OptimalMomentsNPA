@@ -1,4 +1,4 @@
-# This whole file will be generalised later when we add the bell scenario
+
 
 from __future__ import annotations
 from dataclasses import dataclass
@@ -8,10 +8,10 @@ import numpy as np
 import cvxpy as cp
 import scipy.sparse as sp
 
-from spins_sdp.pauli import compile_moment_matrix_rep, Operator, PauliMomentMatrixRep, PauliWord, multiply_words, _real_basis_op_coeff
-from spins_sdp.symmetry import SymmetryManager
+from spins.pauli_logic import compile_moment_matrix_rep, Operator, PauliMomentMatrixRep, PauliWord, multiply_words, _real_basis_op_coeff
+from spins.symmetry import SymmetryManager
 
-# Later we will generalise this to account for the bell scenario
+
 @dataclass(frozen=True, slots=True)
 class PauliMomentSDP:
     rep: PauliMomentMatrixRep
@@ -120,7 +120,7 @@ def solve_pauli_relaxation(
     problem.solve(solver="MOSEK", verbose=verbose, **default_solver_opts)
     
     return float(problem.value)
-    
+
 
 # ----------------------------------
 # Block diagonalization
@@ -289,7 +289,7 @@ def build_block_diagonal_sdp(
 
 
 # ------------------------------------------------------------------
-# Observable bounding given energy constraints
+# General ground-state observable
 # ------------------------------------------------------------------
 
 @dataclass(frozen=True, slots=True)

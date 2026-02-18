@@ -2,7 +2,7 @@ import numpy as np
 import qutip as qt
 from typing import List, Tuple, Union, Literal
 
-from spins_sdp.models import Qobj
+from spins.models import Qobj
 
 BoundaryType = Literal["open", "periodic"]
 AxisType = Literal["x", "y", "z"]

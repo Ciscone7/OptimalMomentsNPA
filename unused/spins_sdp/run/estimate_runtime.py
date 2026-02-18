@@ -48,7 +48,7 @@ if __package__ is None:  # pragma: no cover
 
 
 try:
-    from spins_sdp.basis_builder import generate_heisenberg_paper_basis, generate_npa_basis
+    from spins.basis_builder import generate_heisenberg_paper_basis, generate_npa_basis
 except ModuleNotFoundError as e:  # pragma: no cover
     raise SystemExit(
         "Missing runtime dependencies for the estimator.\n"
@@ -153,7 +153,7 @@ def pick_mode_block(config: Dict[str, Any], *, test: bool) -> Dict[str, Any]:
 def _get_symmetry_manager(N: int, global_cfg: Dict[str, Any]):
     """Create a SymmetryManager from global config symmetry settings."""
     try:
-        from spins_sdp.symmetry import SymmetryManager
+        from spins.symmetry import SymmetryManager
         
         sym_cfg = global_cfg.get("symmetry", {})
         return SymmetryManager(
@@ -172,7 +172,7 @@ def _get_symmetry_manager(N: int, global_cfg: Dict[str, Any]):
 def count_n_vars(basis: List[Any], sym_manager) -> int:
     """Count the number of independent SDP variables after symmetry reduction."""
     try:
-        from spins_sdp.sdp import build_block_reps
+        from spins.spins_sdp import build_block_reps
         _, global_index = build_block_reps(basis, sym_manager)
         return len(set(global_index.values()))
     except ImportError:

@@ -1,19 +1,24 @@
 """
 Bell NPA hierarchy for bipartite scenarios with projective measurements.
 
-Algebra:
-  - Alice projectors: E_{a|x} for settings x in {0,...,m_A-1}, outcomes a in {0,...,d_A-1}
-  - Bob projectors: F_{b|y} for settings y in {0,...,m_B-1}, outcomes b in {0,...,d_B-1}
+Definitions:
+  - Alice projectors: Ax|a for settings x in {0,...,m_A-1}, outcomes a in {0,...,d_A-1}
+  - Bob projectors: By|b for settings y in {0,...,m_B-1}, outcomes b in {0,...,d_B-1}
 
-Relations:
-  - Idempotence: E_{a|x}^2 = E_{a|x}, F_{b|y}^2 = F_{b|y}
-  - Orthogonality: E_{a|x} E_{a'|x} = 0 for a != a', same for Bob
-  - Completeness: sum_a E_{a|x} = I, sum_b F_{b|y} = I
-  - Commutation: [E_{a|x}, F_{b|y}] = 0 for all a,b,x,y
-  - Hermitian: E_{a|x}^dag = E_{a|x}, F_{b|y}^dag = F_{b|y}
+Display:
+  BellWord.__repr__ always uses the full form Ax|a / By|b.
+  For compact display, use scenario.format_word(w) which
+  drops the outcome label for binary outcomes: A0|0 → A0, B1|0 → B1.
+
+Algebra:
+  - Idempotence: (Ax|a)^2 = Ax|a, (By|b)^2 = By|b
+  - Orthogonality: Ax|a · Ax|a' = 0 for a != a', same for Bob
+  - Completeness: sum_a Ax|a = I, sum_b By|b = I
+  - Commutation: [Ax|a, By|b] = 0 for all a,b,x,y
+  - Hermitian: (Ax|a)^dag = Ax|a, (By|b)^dag = By|b
 
 IMPORTANT: Within a single party, projectors for *different* settings do NOT commute.
-  E_{a|x} E_{a'|x'} != E_{a'|x'} E_{a|x} in general when x != x'.
+  Ax|a · Ax'|a' != Ax'|a' · Ax|a in general when x != x'.
   Words must track the *ordered* sequence of projectors per party.
 
 Storage: ordered tuples of (setting, outcome) pairs per party.
@@ -24,7 +29,7 @@ Storage: ordered tuples of (setting, outcome) pairs per party.
 from __future__ import annotations
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import Dict, List, Literal, Optional, Tuple
+from typing import Dict, List, Literal, Optional, Tuple, Union
 
 import numpy as np
 
@@ -77,6 +82,169 @@ class BellScenario:
         """Number of reduced generators: (d-1) outcomes per setting + identity."""
         return self.m_A * (self.d_A - 1) + self.m_B * (self.d_B - 1) + 1
 
+    # --- Projector constructors ---
+
+    @lru_cache(maxsize=None)
+    def alice_projector(self, x: int, a: int) -> BellWord:
+        """Create an Alice projector word for setting *x*, outcome *a*."""
+        if not (0 <= x < self.m_A):
+            raise ValueError(f"Setting x={x} out of range [0, {self.m_A})")
+        if not (0 <= a < self.d_A):
+            raise ValueError(
+                f"Outcome a={a} out of range [0, {self.d_A}) for setting x={x}"
+            )
+        return BellWord(alice_seq=((x, a),), bob_seq=_EMPTY_SEQ)
+
+    @lru_cache(maxsize=None)
+    def bob_projector(self, y: int, b: int) -> BellWord:
+        """Create a Bob projector word for setting *y*, outcome *b*."""
+        if not (0 <= y < self.m_B):
+            raise ValueError(f"Setting y={y} out of range [0, {self.m_B})")
+        if not (0 <= b < self.d_B):
+            raise ValueError(
+                f"Outcome b={b} out of range [0, {self.d_B}) for setting y={y}"
+            )
+        return BellWord(alice_seq=_EMPTY_SEQ, bob_seq=((y, b),))
+
+    def generators(self) -> List[BellWord]:
+        """Reduced generator set: (d-1) outcomes per setting, plus identity."""
+        gens: List[BellWord] = [IDENTITY]
+        for x in range(self.m_A):
+            for a in range(self.d_A - 1):
+                gens.append(self.alice_projector(x, a))
+        for y in range(self.m_B):
+            for b in range(self.d_B - 1):
+                gens.append(self.bob_projector(y, b))
+        return gens
+
+    def npa_basis(self, k: Union[int, float]) -> BellBasis:
+        """Generate the NPA basis at level *k*.
+
+        Supports fractional level ``k=1.5`` (the *local* basis): NPA level 1
+        augmented with all Alice × Bob cross-party products.
+        """
+        if k == 1.5:
+            return self._npa_basis_local()
+
+        k = int(k)
+        if k < 0:
+            raise ValueError("k must be >= 0.")
+
+        I = IDENTITY
+        gens = self.generators()
+
+        levels: List[List[BellWord]] = [[] for _ in range(k + 1)]
+        min_len: Dict[BellWord, int] = {I: 0}
+        frontier: List[BellWord] = [I]
+        levels[0] = [I]
+
+        for length in range(1, k + 1):
+            next_set: set[BellWord] = set()
+            for w in frontier:
+                for g in gens:
+                    w_new = multiply_words(w, g)
+                    if w_new is not None and w_new not in min_len:
+                        min_len[w_new] = length
+                        next_set.add(w_new)
+
+            next_level = sorted(next_set, key=_word_sort_key)
+            levels[length] = next_level
+            frontier = next_level
+
+            if not frontier:
+                levels = levels[:length + 1]
+                break
+
+        all_words = list(min_len.keys())
+        all_words_sorted = sorted(
+            all_words,
+            key=lambda w: (min_len[w], _word_sort_key(w)),
+        )
+        index = {w: i for i, w in enumerate(all_words_sorted)}
+
+        return BellBasis(
+            scenario=self,
+            k=k,
+            words=all_words_sorted,
+            levels=levels,
+            min_len=min_len,
+            index=index,
+        )
+
+    # --- Display helpers ---
+
+    def format_word(self, w: BellWord) -> str:
+        """Human-friendly string for *w* in this scenario's context.
+
+        For binary outcomes (d=2) the outcome label is dropped:
+        ``A0|0`` → ``A0``, ``B1|0`` → ``B1``.
+        For non-binary outcomes the full form is kept.
+        """
+        if w.is_identity():
+            return "I"
+        parts: list[str] = []
+        drop_a = self.d_A == 2
+        drop_b = self.d_B == 2
+        for x, a in w.alice_seq:
+            parts.append(f"A{x}" if drop_a else f"A{x}|{a}")
+        for y, b in w.bob_seq:
+            parts.append(f"B{y}" if drop_b else f"B{y}|{b}")
+        return " ".join(parts)
+
+    def format_basis(self, basis: BellBasis) -> List[str]:
+        """Format every word in *basis* using :meth:`format_word`."""
+        return [self.format_word(w) for w in basis.words]
+
+    def format_operator(self, op: Dict[BellWord, float]) -> str:
+        """Human-friendly string for a BellOperator."""
+        if not op:
+            return "0"
+        parts: list[str] = []
+        for word, coeff in sorted(op.items(), key=lambda t: str(t[0])):
+            if abs(coeff) < 1e-12:
+                continue
+            parts.append(f"{coeff:+.1f} · {self.format_word(word)}")
+        return "\n".join(parts) if parts else "0"
+
+    def _npa_basis_local(self) -> BellBasis:
+        """NPA 1 + Alice×Bob cross products ('local' / level-1.5 basis)."""
+        base = self.npa_basis(1)
+
+        alice_words = [w for w in base.words
+                       if w.alice_len() == 1 and w.bob_len() == 0]
+        bob_words = [w for w in base.words
+                     if w.alice_len() == 0 and w.bob_len() == 1]
+
+        cross: List[BellWord] = []
+        seen = set(base.index.keys())
+        for aw in alice_words:
+            for bw in bob_words:
+                w = multiply_words(aw, bw)
+                if w is not None and w not in seen:
+                    cross.append(w)
+                    seen.add(w)
+
+        cross_sorted = sorted(cross, key=_word_sort_key)
+
+        all_words = base.words + cross_sorted
+        index = {w: i for i, w in enumerate(all_words)}
+        min_len = dict(base.min_len)
+        for w in cross_sorted:
+            min_len[w] = 2
+
+        levels = list(base.levels)
+        if cross_sorted:
+            levels.append(cross_sorted)
+
+        return BellBasis(
+            scenario=self,
+            k=1.5,
+            words=all_words,
+            levels=levels,
+            min_len=min_len,
+            index=index,
+        )
+
 
 # ---------------------------------------------------------------------------
 # BellWord: ordered sequence representation
@@ -92,7 +260,7 @@ class BellWord:
       bob_seq:   ((y1, b1), (y2, b2), ...) -- ordered, no adjacent same-setting
 
     The full operator is:
-      E_{a1|x1} E_{a2|x2} ... * F_{b1|y1} F_{b2|y2} ...
+      A{x1}|{a1} A{x2}|{a2} ... · B{y1}|{b1} B{y2}|{b2} ...
 
     A word is "reduced" if no two adjacent elements in either sequence share
     the same setting. (If they did, they'd reduce by idempotence or be zero
@@ -118,8 +286,8 @@ class BellWord:
     def dagger(self) -> BellWord:
         """
         Hermitian adjoint: reverse each party's sequence.
-        (E_{a1|x1} E_{a2|x2} ... F_{b1|y1} ...)^dag
-        = ... F_{b1|y1} ... E_{a2|x2} E_{a1|x1}
+        (A{x1}|{a1} A{x2}|{a2} ... B{y1}|{b1} ...)^dag
+        = ... B{y1}|{b1} ... A{x2}|{a2} A{x1}|{a1}
         After [A,B]=0 commutation -> reverse(Alice) * reverse(Bob)
         """
         return BellWord(
@@ -130,20 +298,15 @@ class BellWord:
     def __repr__(self) -> str:
         parts = []
         for x, a in self.alice_seq:
-            parts.append(f"E_{a}|{x}")
+            parts.append(f"A{x}|{a}")
         for y, b in self.bob_seq:
-            parts.append(f"F_{b}|{y}")
+            parts.append(f"B{y}|{b}")
         if not parts:
             return "I"
         return " ".join(parts)
 
 
 ZeroWord = None
-
-
-# ---------------------------------------------------------------------------
-# Word constructors
-# ---------------------------------------------------------------------------
 
 _EMPTY_SEQ: Tuple[Tuple[int, int], ...] = ()
 IDENTITY = BellWord(alice_seq=_EMPTY_SEQ, bob_seq=_EMPTY_SEQ)
@@ -154,22 +317,7 @@ def identity_word(scenario: BellScenario) -> BellWord:
     return IDENTITY
 
 
-@lru_cache(maxsize=None)
-def alice_projector(scenario: BellScenario, x: int, a: int) -> BellWord:
-    if not (0 <= x < scenario.m_A):
-        raise ValueError(f"Setting x={x} out of range [0, {scenario.m_A})")
-    if not (0 <= a < scenario.d_A):
-        raise ValueError(f"Outcome a={a} out of range [0, {scenario.d_A}) for setting x={x}")
-    return BellWord(alice_seq=((x, a),), bob_seq=_EMPTY_SEQ)
 
-
-@lru_cache(maxsize=None)
-def bob_projector(scenario: BellScenario, y: int, b: int) -> BellWord:
-    if not (0 <= y < scenario.m_B):
-        raise ValueError(f"Setting y={y} out of range [0, {scenario.m_B})")
-    if not (0 <= b < scenario.d_B):
-        raise ValueError(f"Outcome b={b} out of range [0, {scenario.d_B}) for setting y={y}")
-    return BellWord(alice_seq=_EMPTY_SEQ, bob_seq=((y, b),))
 
 
 # ---------------------------------------------------------------------------
@@ -207,10 +355,10 @@ def _concat_and_reduce(
     x_first, a_first = seq2[0]
 
     if a_last == a_first:
-        # Idempotence: E_{a|x}^2 = E_{a|x} — drop one copy
+        # Idempotence: (Ax|a)^2 = Ax|a — drop one copy
         return seq1[:-1] + seq2
     else:
-        # Orthogonality: E_{a|x} E_{a'|x} = 0
+        # Orthogonality: Ax|a · Ax|a' = 0
         return None
 
 
@@ -239,78 +387,15 @@ def multiply_words(w1: BellWord, w2: BellWord) -> Optional[BellWord]:
 @dataclass(frozen=True, slots=True)
 class BellBasis:
     scenario: BellScenario
-    k: int
+    k: Union[int, float]
     words: List[BellWord]
     levels: List[List[BellWord]]
     min_len: Dict[BellWord, int]
     index: Dict[BellWord, int]
 
 
-def all_generators(scenario: BellScenario) -> List[BellWord]:
-    """
-    Reduced generator set: for each setting, only outcomes 0..d-2
-    (the last outcome is implicitly I - sum of the others via completeness).
-    The identity is included as a generator so that the BFS can produce
-    words involving the implicit last-outcome substitution.
-    """
-    gens: List[BellWord] = [IDENTITY]
-    for x in range(scenario.m_A):
-        for a in range(scenario.d_A - 1):
-            gens.append(alice_projector(scenario, x, a))
-    for y in range(scenario.m_B):
-        for b in range(scenario.d_B - 1):
-            gens.append(bob_projector(scenario, y, b))
-    return gens
-
-
 def _word_sort_key(w: BellWord) -> Tuple:
     return (w.total_len(), w.alice_seq, w.bob_seq)
-
-
-def generate_npa_basis(scenario: BellScenario, k: int) -> BellBasis:
-    if k < 0:
-        raise ValueError("k must be >= 0.")
-
-    I = identity_word(scenario)
-    gens = all_generators(scenario)
-
-    levels: List[List[BellWord]] = [[] for _ in range(k + 1)]
-    min_len: Dict[BellWord, int] = {I: 0}
-    frontier: List[BellWord] = [I]
-    levels[0] = [I]
-
-    for length in range(1, k + 1):
-        next_set: set[BellWord] = set()
-        for w in frontier:
-            for g in gens:
-                w_new = multiply_words(w, g)
-                if w_new is not None and w_new not in min_len:
-                    min_len[w_new] = length
-                    next_set.add(w_new)
-
-        next_level = sorted(next_set, key=_word_sort_key)
-        levels[length] = next_level
-        frontier = next_level
-
-        if not frontier:
-            levels = levels[:length + 1]
-            break
-
-    all_words = list(min_len.keys())
-    all_words_sorted = sorted(
-        all_words,
-        key=lambda w: (min_len[w], _word_sort_key(w)),
-    )
-    index = {w: i for i, w in enumerate(all_words_sorted)}
-
-    return BellBasis(
-        scenario=scenario,
-        k=k,
-        words=all_words_sorted,
-        levels=levels,
-        min_len=min_len,
-        index=index,
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -412,8 +497,8 @@ def expand_bell_operator(
     """
     Expand a BellOperator so it only references outcomes 0..d-2 per setting.
 
-    For each word containing a last-outcome projector E_{d-1|x} (or F_{d-1|y}),
-    substitute  E_{d-1|x} = I - sum_{a=0}^{d-2} E_{a|x}  (completeness).
+    For each word containing a last-outcome projector (A{x}|{d-1} or B{y}|{d-1}),
+    substitute via completeness: A{x}|{d-1} = I - sum_{a<d-1} A{x}|{a}.
 
     This must be applied to the objective operator before passing it to the SDP
     when the generator set excludes last outcomes.
@@ -441,7 +526,7 @@ def _expand_word(
     # Check Alice sequence for any last-outcome projector
     for i, (x, a) in enumerate(w.alice_seq):
         if a == scenario.d_A - 1:
-            # E_{d-1|x} = I - sum_{a'=0}^{d-2} E_{a'|x}
+            # A{x}|{d-1} = I - sum_{a'=0}^{d-2} A{x}|{a'}
             # Build prefix and suffix words
             prefix = BellWord(alice_seq=w.alice_seq[:i], bob_seq=_EMPTY_SEQ)
             suffix = BellWord(alice_seq=w.alice_seq[i+1:], bob_seq=w.bob_seq)
@@ -500,8 +585,8 @@ def chsh_operator(scenario: BellScenario) -> BellOperator:
                 sign_ab = (-1) ** (a + b)
                 coef = c_xy * sign_ab
                 w = multiply_words(
-                    alice_projector(scenario, x, a),
-                    bob_projector(scenario, y_setting, b),
+                    scenario.alice_projector(x, a),
+                    scenario.bob_projector(y_setting, b),
                 )
                 if w is not None:
                     op[w] = op.get(w, 0) + coef
@@ -511,8 +596,8 @@ def chsh_operator(scenario: BellScenario) -> BellOperator:
 
 def probability_word(scenario: BellScenario, x: int, a: int, y: int, b: int) -> Optional[BellWord]:
     return multiply_words(
-        alice_projector(scenario, x, a),
-        bob_projector(scenario, y, b),
+        scenario.alice_projector(x, a),
+        scenario.bob_projector(y, b),
     )
 
 

@@ -207,4 +207,6 @@ marimo/_lsp/
 __marimo__/
 
 
-spins_sdp/results/
+results/
+unused/
+plots/

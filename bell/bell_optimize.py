@@ -32,7 +32,6 @@ from bell.bell_logic import (
     Sense,
     compile_moment_matrix_rep,
     expand_bell_operator,
-    generate_npa_basis,
     _word_sort_key,
 )
 from bell.bell_sdp import (
@@ -64,7 +63,7 @@ def build_bell_basis_sets(
     Returns:
         Tuple of (starting_set, adding_set, final_set).
     """
-    full_basis = generate_npa_basis(scenario, end_level)
+    full_basis = scenario.npa_basis(end_level)
 
     starting_set: List[BellWord] = []
     for level_idx in range(min(start_level + 1, len(full_basis.levels))):

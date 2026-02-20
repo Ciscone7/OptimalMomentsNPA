@@ -21,11 +21,19 @@ Examples::
 from __future__ import annotations
 
 import argparse
+import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import numpy as np
 from tqdm import tqdm
+
+_SCRIPT_DIR = Path(__file__).resolve().parent
+_SCRIPTS_DIR = _SCRIPT_DIR.parent
+_PROJECT_ROOT = _SCRIPTS_DIR.parent
+sys.path.insert(0, str(_SCRIPT_DIR))          # for _common
+sys.path.insert(0, str(_SCRIPTS_DIR))          # for config_utils
+sys.path.insert(0, str(_PROJECT_ROOT))         # for project packages
 
 from spins.basis_builder import (
     generate_heisenberg_j2_basis_strong,
@@ -34,7 +42,8 @@ from spins.basis_builder import (
     generate_npa_basis,
 )
 from artifact_manager import ArtifactManager
-from spins_sdp.scripts._common import (
+from config_utils import add_config_arg, parse_with_config
+from _common import (
     add_symmetry_args,
     hamiltonian_dict_fn,
     model_params_from_args,
@@ -165,7 +174,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
 
-    n_group = p.add_mutually_exclusive_group(required=True)
+    add_config_arg(p)
+
+    n_group = p.add_mutually_exclusive_group()
     n_group.add_argument("--Ns", nargs="+", type=int, help="Explicit list of N values")
     n_group.add_argument("--N-min", dest="N_min", type=int, help="Minimum N (inclusive)")
     p.add_argument("--N-max", dest="N_max", type=int,
@@ -201,7 +212,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--resume", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--force", action="store_true")
 
-    args = p.parse_args(argv)
+    args, _sources = parse_with_config(p, argv)
     Ns = parse_ns_from_args(args)
     model_params = model_params_from_args(args)
     symmetry_config = symmetry_config_from_args(args)

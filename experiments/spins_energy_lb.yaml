@@ -1,0 +1,8 @@
+# NPA moment-relaxation lower bound for Heisenberg model
+model: heisenberg
+basis: npa
+npa_level: 2
+Ns: [4, 6, 8]
+boundary: periodic
+mosek_tol: 1.0e-9
+repeats: 1

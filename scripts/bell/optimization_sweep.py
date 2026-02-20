@@ -31,6 +31,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import struct
+import sys
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
@@ -39,7 +40,13 @@ import numpy as np
 if TYPE_CHECKING:
     import pandas as pd
 
+_SCRIPTS_DIR = Path(__file__).resolve().parent.parent
+_PROJECT_ROOT = _SCRIPTS_DIR.parent
+sys.path.insert(0, str(_SCRIPTS_DIR))          # for config_utils
+sys.path.insert(0, str(_PROJECT_ROOT))         # for project packages
+
 from artifact_manager import ArtifactManager, RunDir
+from config_utils import add_config_arg, parse_with_config
 from bell.bell_logic import (
     BellScenario,
     BellWord,
@@ -448,10 +455,12 @@ def main(argv: Optional[List[str]] = None) -> int:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
 
+    add_config_arg(p)
+
     # Scenario parameters
-    p.add_argument("--m-A", type=int, required=True,
+    p.add_argument("--m-A", type=int, default=None,
                    help="Number of settings for Alice")
-    p.add_argument("--m-B", type=int, required=True,
+    p.add_argument("--m-B", type=int, default=None,
                    help="Number of settings for Bob")
     p.add_argument("--d-A", type=int, default=2,
                    help="Number of outcomes for Alice (default: 2)")
@@ -500,11 +509,11 @@ def main(argv: Optional[List[str]] = None) -> int:
                    help="Chain k-values: best mask at k_i warm-starts k_{i+1}")
 
     # Sweep parameters
-    k_group = p.add_mutually_exclusive_group(required=True)
+    k_group = p.add_mutually_exclusive_group()
     k_group.add_argument("--ks", nargs="+", type=int, help="Explicit k values")
     k_group.add_argument("--k-max", type=int, help="Sweep k from 0 to k-max")
 
-    seed_group = p.add_mutually_exclusive_group(required=True)
+    seed_group = p.add_mutually_exclusive_group()
     seed_group.add_argument("--seeds", nargs="+", type=int, help="Explicit seeds")
     seed_group.add_argument("--num-seeds", type=int,
                             help="Number of seeds (starting from 42)")
@@ -519,7 +528,17 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--force", action="store_true")
     p.add_argument("--verbose", action="store_true", default=True)
 
-    args = p.parse_args(argv)
+    args, _sources = parse_with_config(p, argv)
+
+    # Post-parse validation for required params
+    if args.m_A is None:
+        p.error("--m-A is required (via CLI or config)")
+    if args.m_B is None:
+        p.error("--m-B is required (via CLI or config)")
+    if args.ks is None and args.k_max is None:
+        p.error("--ks or --k-max is required (via CLI or config)")
+    if args.seeds is None and args.num_seeds is None:
+        p.error("--seeds or --num-seeds is required (via CLI or config)")
 
     scenario = BellScenario(
         m_A=args.m_A, m_B=args.m_B,

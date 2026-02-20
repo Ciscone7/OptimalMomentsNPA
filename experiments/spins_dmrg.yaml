@@ -1,0 +1,9 @@
+# DMRG upper bound for Heisenberg model (small system, low bond dimension)
+model: heisenberg
+Ns: [4, 6, 8]
+chi_max: 64
+conserve: Sz
+init: neel
+mixer: true
+dchi: 32
+nsweeps: 2

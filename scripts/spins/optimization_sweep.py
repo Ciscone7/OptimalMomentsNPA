@@ -29,6 +29,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import struct
+import sys
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
@@ -37,8 +38,16 @@ import numpy as np
 if TYPE_CHECKING:
     import pandas as pd
 
+_SCRIPT_DIR = Path(__file__).resolve().parent
+_SCRIPTS_DIR = _SCRIPT_DIR.parent
+_PROJECT_ROOT = _SCRIPTS_DIR.parent
+sys.path.insert(0, str(_SCRIPT_DIR))          # for _common
+sys.path.insert(0, str(_SCRIPTS_DIR))          # for config_utils
+sys.path.insert(0, str(_PROJECT_ROOT))         # for project packages
+
 from artifact_manager import ArtifactManager, RunDir
-from scripts._common import (
+from config_utils import add_config_arg, parse_with_config
+from _common import (
     add_symmetry_args,
     build_basis_sets,
     hamiltonian_dict_fn,
@@ -421,10 +430,12 @@ def main(argv: Optional[List[str]] = None) -> int:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
 
+    add_config_arg(p)
+
     # Model parameters
     p.add_argument("--model", choices=["ising", "heisenberg", "heisenberg_j2"],
                    default="heisenberg")
-    p.add_argument("--N", type=int, required=True, help="Number of sites")
+    p.add_argument("--N", type=int, default=None, help="Number of sites")
     p.add_argument("--boundary", choices=["open", "periodic"], default="periodic")
 
     p.add_argument("--J", type=float, default=1.0, help="Coupling strength J")
@@ -475,11 +486,11 @@ def main(argv: Optional[List[str]] = None) -> int:
                    help="Chain k-values: best mask at k_i warm-starts k_{i+1}")
 
     # Sweep parameters
-    k_group = p.add_mutually_exclusive_group(required=True)
+    k_group = p.add_mutually_exclusive_group()
     k_group.add_argument("--ks", nargs="+", type=int, help="Explicit k values")
     k_group.add_argument("--k-max", type=int, help="Sweep k from 0 to k-max")
 
-    seed_group = p.add_mutually_exclusive_group(required=True)
+    seed_group = p.add_mutually_exclusive_group()
     seed_group.add_argument("--seeds", nargs="+", type=int, help="Explicit seeds")
     seed_group.add_argument("--num-seeds", type=int,
                             help="Number of seeds (starting from 42)")
@@ -495,7 +506,15 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--force", action="store_true")
     p.add_argument("--verbose", action="store_true", default=True)
 
-    args = p.parse_args(argv)
+    args, _sources = parse_with_config(p, argv)
+
+    # Post-parse validation for required params
+    if args.N is None:
+        p.error("--N is required (via CLI or config)")
+    if args.ks is None and args.k_max is None:
+        p.error("--ks or --k-max is required (via CLI or config)")
+    if args.seeds is None and args.num_seeds is None:
+        p.error("--seeds or --num-seeds is required (via CLI or config)")
 
     # Build k values
     k_values = sorted(set(args.ks)) if args.ks is not None else list(range(args.k_max + 1))

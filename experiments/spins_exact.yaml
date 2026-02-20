@@ -1,0 +1,8 @@
+# Exact diagonalization for Ising model (small sizes for testing)
+model: ising
+Ns: [4, 6, 8]
+boundary: periodic
+J: 1.0
+h: 0.7
+k: 0.3
+repeats: 1

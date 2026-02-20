@@ -19,5 +19,7 @@ physics-tenpy
 # NOTE:
 # - pandas is optional now (only needed for dataframe helpers).
 
+PyYAML
+
 # Bayesian optimization
 scikit-learn

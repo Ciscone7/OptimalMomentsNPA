@@ -1,0 +1,10 @@
+# Spin optimization sweep for Heisenberg model (quick test)
+model: heisenberg
+N: 4
+boundary: periodic
+start_level: 1
+end_level: 2
+method: sa
+ks: [0, 1, 2]
+seeds: [42, 43]
+sa_steps: 50

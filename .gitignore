@@ -210,3 +210,7 @@ __marimo__/
 results/
 unused/
 plots/
+workflow_demo.ipynb
+plots.py
+demo_notebooks/observable_optimization.ipynb
+unused/initial_tests.ipynb

@@ -10,6 +10,8 @@ from pathlib import Path
 
 import numpy as np
 
+from spins.symmetry import SymmetryManager
+
 if TYPE_CHECKING:
     import pandas as pd
 
@@ -26,7 +28,7 @@ def _require_pandas():
 
 from spins.basis_builder import generate_npa_basis
 from spins.pauli_logic import Operator, PauliWord
-from spins.models import ising_hamiltonian_exact, ising_hamiltonian_dict
+from spins.models import heisenberg_hamiltonian_dict, heisenberg_hamiltonian_exact, ising_hamiltonian_exact, ising_hamiltonian_dict
 from spins.spins_sdp import solve_pauli_relaxation
 
 
@@ -47,7 +49,7 @@ def _time_best_avg(fn, repeats: int):
 def benchmark_exact_diagonalization(
     N_values,
     J=1.0, h=0.0, k=0.0,
-    boundary="open",
+    boundary="periodic",
     repeats=3,
 ):
     """
@@ -62,7 +64,7 @@ def benchmark_exact_diagonalization(
 
     for idx, N in enumerate(Ns):
         def run():
-            H = ising_hamiltonian_exact(N, J=J, h=h, k=k, boundary=boundary)
+            H = heisenberg_hamiltonian_exact(N, boundary=boundary)
             evals, _ = H.eigenstates(eigvals=1)
             E0 = evals[0]
             return float(E0)
@@ -88,10 +90,8 @@ def benchmark_relaxation(
     basis_fn: Callable[[int], List[PauliWord]],
     operator_fn: Callable[[int], Operator],
     sense: Literal["min", "max"] = "min",
-    solver: str = "MOSEK",
     repeats: int = 1,
     mosek_tol: float = 1e-9,
-    solver_opts: Optional[Dict[str, Any]] = None,
 ) -> Dict:
     """
     General benchmark for moment relaxation over varying N.
@@ -104,11 +104,13 @@ def benchmark_relaxation(
         solver: default "MOSEK"
         repeats: Number of timing repeats (best and average reported)
         mosek_tol: MOSEK conic tolerance
-        solver_opts: Override default solver options
+        symmetry_manager: Symmetry manager for the relaxation (default None)
         
     Returns:
         Dict with arrays: N, objective_values, t_best, t_avg
     """
+    
+    
     Ns = np.array(list(N_values), dtype=int)
     
     objective_values = np.empty(len(Ns), dtype=float)
@@ -126,9 +128,8 @@ def benchmark_relaxation(
                 basis=basis,
                 operator=operator,
                 sense=sense,
-                solver=solver,
                 mosek_tol=mosek_tol,
-                solver_opts=solver_opts,
+                symmetry_manager=SymmetryManager.default_for_heisenberg(N),
                 verbose=False,
             )
             return obj_val
@@ -144,7 +145,7 @@ def benchmark_relaxation(
         "t_best": t_best,
         "t_avg": t_avg,
         "meta": {
-            "solver": solver,
+            "solver": "MOSEK",
             "repeats": repeats,
             "mosek_tol": mosek_tol,
             "sense": sense,
@@ -157,11 +158,8 @@ def benchmark_npa_relaxation(
     N_values,
     NPA_level: int,
     J=1.0, h=0.0, k=0.0,
-    boundary="open",
-    solver="MOSEK",
+    boundary="periodic",
     repeats=1,
-    mosek_tol=1e-9,
-    solver_opts: Optional[Dict[str, Any]] = None,
 ):
     """
     Convenience wrapper for NPA hierarchy benchmarks on 1D Ising model.
@@ -181,12 +179,9 @@ def benchmark_npa_relaxation(
     result = benchmark_relaxation(
         N_values=N_values,
         basis_fn=basis_fn,
-        operator_fn=lambda N: ising_hamiltonian_dict(N=N, J=J, h=h, k=k, boundary=boundary),
+        operator_fn=lambda N: heisenberg_hamiltonian_dict(N=N, boundary=boundary),
         sense="min",
-        solver=solver,
         repeats=repeats,
-        mosek_tol=mosek_tol,
-        solver_opts=solver_opts,
     )
     
     # Add NPA-specific metadata

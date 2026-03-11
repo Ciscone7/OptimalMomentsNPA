@@ -35,6 +35,13 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
+# Ensure prints are flushed immediately (important when output is
+# redirected to a log file via nohup).
+try:
+    sys.stdout.reconfigure(line_buffering=True)  # type: ignore[union-attr]
+except AttributeError:
+    pass  # Python < 3.7 fallback: run with python -u
+
 if TYPE_CHECKING:
     import pandas as pd
 
@@ -63,9 +70,6 @@ from spins.symmetry import SymmetryManager
 
 
 ARTIFACT = "spin_optimization_sweep"
-
-# Re-export for backward compatibility (used by fraction_scaling.py)
-make_objective_function = make_spin_objective
 
 
 def _require_pandas():

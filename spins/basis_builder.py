@@ -121,6 +121,50 @@ def generate_npa_basis(N: int, k: int) -> PauliNPABasis:
         index=index,
     )
 
+def generate_npa1_5_basis(N: int) -> List[PauliWord]:
+    """
+    Generate a "NPA 1.5" basis: NPA level 1 + contiguous nearest-neighbour pairs.
+
+    This is the minimal basis containing all monomials that appear in the
+    periodic Heisenberg Hamiltonian (σ_i^a σ_{i+1}^b for a,b in {x,y,z}).
+
+    Contents (after deduplication):
+      - Identity I
+      - All single-site Paulis  σ_i^a  (3N words)
+      - Nearest-neighbour pairs σ_i^a σ_{(i+1)%N}^b  (up to 9N words, minus overlaps)
+
+    Words are returned sorted by (support_size, x_mask, z_mask).
+    """
+    seen: Set[PauliWord] = set()
+    words: List[PauliWord] = []
+
+    def _add(w: PauliWord) -> None:
+        if w not in seen:
+            seen.add(w)
+            words.append(w)
+
+    # Identity
+    _add(PauliWord(0, 0))
+
+    # Level 1: single-site Paulis
+    for i in range(N):
+        for axis in ("x", "y", "z"):
+            _add(local_pauli(i, axis))
+
+    # Level 1.5: contiguous nearest-neighbour pairs (PBC)
+    axes = ("x", "y", "z")
+    for i in range(N):
+        j = (i + 1) % N
+        for a in axes:
+            for b in axes:
+                _, w = multiply_words(local_pauli(i, a), local_pauli(j, b))
+                _add(w)
+
+    # Sort deterministically
+    words.sort(key=lambda w: (w.support_size(), w.x_mask, w.z_mask))
+    return words
+
+
 def _paper_default_r(N: int) -> int:
     """
     Paper choice: r = N/2 for N <= 60, and r = 20 for N = 80,100.

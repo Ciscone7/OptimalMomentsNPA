@@ -75,6 +75,27 @@ class SymmetryManager:
         return best_w
 
     @lru_cache(maxsize=None)
+    def _canonicalize_spatial(self, w: PauliWord) -> PauliWord:
+        """Return the canonical representative under active spatial symmetries."""
+        spatial_best = w
+
+        if self.use_translation:
+            spatial_best = self.canonical_translation(w)
+
+            if self.use_mirror:
+                reflected = self.canonical_translation(w.reflect(self.N))
+                if (reflected.support_size(), reflected.x_mask, reflected.z_mask) < \
+                   (spatial_best.support_size(), spatial_best.x_mask, spatial_best.z_mask):
+                    spatial_best = reflected
+        elif self.use_mirror:
+            reflected = w.reflect(self.N)
+            if (reflected.support_size(), reflected.x_mask, reflected.z_mask) < \
+               (spatial_best.support_size(), spatial_best.x_mask, spatial_best.z_mask):
+                spatial_best = reflected
+
+        return spatial_best
+
+    @lru_cache(maxsize=None)
     def canonicalize(self, w: PauliWord) -> Optional[PauliWord]:
         """
         Returns the unique canonical representative of 'w' under the active symmetries.
@@ -85,32 +106,7 @@ class SymmetryManager:
             return None
 
         # 2. Spatial Minimization (Translation + Mirror)
-        # We find the "Spatial Canonical Form" first.
-        # Since support/indices dominate the sort order (2^i), 
-        # we can settle spatial position before worrying about S3 types.
-        
-        spatial_best = w
-        
-        if self.use_translation:
-            # Find min in translation orbit
-            spatial_best = self.canonical_translation(w)
-            
-            if self.use_mirror:
-                # Compare against the min of the reflected orbit
-                w_refl = w.reflect(self.N)
-                refl_best = self.canonical_translation(w_refl)
-                
-                # Take the absolute minimum of the two branches
-                if (refl_best.support_size(), refl_best.x_mask, refl_best.z_mask) < \
-                   (spatial_best.support_size(), spatial_best.x_mask, spatial_best.z_mask):
-                    spatial_best = refl_best
-        
-        elif self.use_mirror:
-            # Mirror only (no translation loop)
-            w_refl = w.reflect(self.N)
-            if (w_refl.support_size(), w_refl.x_mask, w_refl.z_mask) < \
-               (w.support_size(), w.x_mask, w.z_mask):
-                spatial_best = w_refl
+        spatial_best = self._canonicalize_spatial(w)
 
         # 3. Permutation Minimization
         # Now that the string is spatially anchored (e.g., at site 0),
@@ -119,7 +115,15 @@ class SymmetryManager:
             if self.use_real_basis:
                 # In the Ỹ=iY basis the Hamiltonian is XX-ỸỸ+ZZ, so only
                 # X↔Z is a valid permutation symmetry (not the full S₃).
-                return canonicalize_xz_swap(spatial_best)
+                swapped = self._canonicalize_spatial(
+                    PauliWord(spatial_best.z_mask, spatial_best.x_mask)
+                )
+
+                return min(
+                    spatial_best,
+                    swapped,
+                    key=lambda word: (word.support_size(), word.x_mask, word.z_mask),
+                )
             return canonicalize_permutation(spatial_best)
         
         return spatial_best
@@ -174,19 +178,6 @@ def apply_permutation(w: PauliWord, p: Tuple[int, int, int]) -> PauliWord:
             new_z_mask |= bit
             
     return PauliWord(new_x_mask, new_z_mask)
-
-@lru_cache(maxsize=None)
-def canonicalize_xz_swap(w: PauliWord) -> PauliWord:
-    """Return the smaller of w and its X↔Z-swapped version.
-
-    X↔Z swaps x_mask and z_mask (Y sites, which have both bits set, are
-    unchanged).  This is the residual permutation symmetry in the Ỹ=iY basis.
-    """
-    swapped = PauliWord(w.z_mask, w.x_mask)
-    w_key = (w.support_size(), w.x_mask, w.z_mask)
-    s_key = (swapped.support_size(), swapped.x_mask, swapped.z_mask)
-    return swapped if s_key < w_key else w
-
 
 @lru_cache(maxsize=None)
 def canonicalize_permutation(w: PauliWord) -> PauliWord:

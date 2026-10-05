@@ -1,8 +1,8 @@
-# SpinsSDP
+# OptimalMomentsNPA
 
-**Certification of many-body quantum properties using semidefinite programming and the NPA hierarchy.**
+**Tools for optimal moment selection in SDP relaxations with NPA hierarchy.**
 
-SpinsSDP is a Python framework for computing certified bounds on ground-state energies and observables of quantum spin chains, as well as for certifying Bell nonlocality. It implements the Navascués–Pironio–Acín (NPA) moment-matrix hierarchy, assembles and solves the resulting semidefinite programs (SDPs) via MOSEK, and provides a suite of combinatorial optimisers for intelligently selecting which monomials to include in the relaxation basis — allowing tight bounds with smaller SDPs.
+OptimalMomentsNPA is a Python framework for computing certified bounds on ground-state energies and observables of quantum spin chains, as well as for certifying Bell nonlocality. It implements the Navascués–Pironio–Acín (NPA) moment-matrix hierarchy, assembles and solves the resulting semidefinite programs (SDPs) via MOSEK, and provides a suite of combinatorial optimisers for intelligently selecting which monomials to include in the relaxation basis — allowing tight bounds with smaller SDPs.
 
 > **Authors:** Francesco Flora (ICFO) and Losel Matos (École Polytechnique)
 

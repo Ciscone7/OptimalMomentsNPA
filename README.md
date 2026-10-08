@@ -105,8 +105,8 @@ Requires **Python ≥ 3.10** and a valid [MOSEK](https://www.mosek.com/) license
 
 ```bash
 # Clone and enter the project
-git clone <repo-url>
-cd SpinsSDP
+git clone https://github.com/Ciscone7/OptimalMomentsNPA.git
+cd OptimalMomentsNPA
 
 # Create a virtual environment and install in editable mode
 python -m venv .venv
